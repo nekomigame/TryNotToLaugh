@@ -140,7 +140,7 @@ def temporary_audio_file():
                 logger.warning(f"一時ファイルの削除に失敗: {e}")
 
 
-def video_player_process(video_path, game_over_event):
+def video_player_process(video_path, game_over_event, fullscreen=False):
     """
     PygameとOpenCVを使用して別のプロセスで動画を再生します。
     """
@@ -198,7 +198,39 @@ def video_player_process(video_path, game_over_event):
 
             # --- Pygameのセットアップ ---
             pygame.display.set_caption("笑ってはいけないチャレンジ - 動画")
-            screen = pygame.display.set_mode(video_size)
+            
+            if fullscreen:
+                # フルスクリーンモード
+                screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+                screen_size = screen.get_size()
+                logger.info(f"フルスクリーンモードで起動: {screen_size}")
+                
+                # アスペクト比を保持してスケーリング
+                video_aspect = video_size[0] / video_size[1]
+                screen_aspect = screen_size[0] / screen_size[1]
+                
+                if video_aspect > screen_aspect:
+                    # 動画の方が横長
+                    scaled_width = screen_size[0]
+                    scaled_height = int(screen_size[0] / video_aspect)
+                else:
+                    # 動画の方が縦長
+                    scaled_height = screen_size[1]
+                    scaled_width = int(screen_size[1] * video_aspect)
+                
+                display_size = (scaled_width, scaled_height)
+                offset_x = (screen_size[0] - scaled_width) // 2
+                offset_y = (screen_size[1] - scaled_height) // 2
+                is_fullscreen = True
+            else:
+                # ウィンドウモード
+                screen = pygame.display.set_mode(video_size)
+                display_size = video_size
+                offset_x = 0
+                offset_y = 0
+                is_fullscreen = False
+                logger.info(f"ウィンドウモードで起動: {video_size}")
+            
             clock = pygame.time.Clock()
 
             # --- 音声再生のセットアップ ---
@@ -287,8 +319,18 @@ def video_player_process(video_path, game_over_event):
                 # --- フレーム表示 ---
                 try:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    surf = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
-                    screen.blit(surf, (0, 0))
+                    
+                    if is_fullscreen:
+                        # フルスクリーンの場合はリサイズして中央配置
+                        frame_resized = cv2.resize(frame_rgb, display_size)
+                        surf = pygame.surfarray.make_surface(frame_resized.swapaxes(0, 1))
+                        screen.fill((0, 0, 0))  # 黒で背景を塗りつぶす
+                        screen.blit(surf, (offset_x, offset_y))
+                    else:
+                        # ウィンドウモードの場合はそのまま表示
+                        surf = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
+                        screen.blit(surf, (0, 0))
+                    
                     pygame.display.flip()
                 except Exception as e:
                     logger.error(f"フレーム描画エラー: {e}")
@@ -303,6 +345,30 @@ def video_player_process(video_path, game_over_event):
                             logger.info("ESCキーが押されました。ゲームを終了します")
                             running = False
                             game_over_event.set()
+                        elif event.key == pygame.K_F11 or event.key == pygame.K_f:
+                            # フルスクリーン切り替え
+                            is_fullscreen = not is_fullscreen
+                            if is_fullscreen:
+                                screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+                                screen_size = screen.get_size()
+                                video_aspect = video_size[0] / video_size[1]
+                                screen_aspect = screen_size[0] / screen_size[1]
+                                if video_aspect > screen_aspect:
+                                    scaled_width = screen_size[0]
+                                    scaled_height = int(screen_size[0] / video_aspect)
+                                else:
+                                    scaled_height = screen_size[1]
+                                    scaled_width = int(screen_size[1] * video_aspect)
+                                display_size = (scaled_width, scaled_height)
+                                offset_x = (screen_size[0] - scaled_width) // 2
+                                offset_y = (screen_size[1] - scaled_height) // 2
+                                logger.info("フルスクリーンモードに切り替え")
+                            else:
+                                screen = pygame.display.set_mode(video_size)
+                                display_size = video_size
+                                offset_x = 0
+                                offset_y = 0
+                                logger.info("ウィンドウモードに切り替え")
 
                 # フレームレートを制御（音声同期を優先）
                 clock.tick(video_fps * 1.5)
@@ -340,6 +406,9 @@ class App(tk.Tk):
         self.cap_webcam = None
         self.camera_list = []
         self.selected_camera = tk.StringVar()
+        
+        # 表示モード設定
+        self.display_mode = tk.StringVar(value="window")  # デフォルトはウィンドウモード
         
         # フィード更新制御
         self._is_updating_feed = False
@@ -381,6 +450,22 @@ class App(tk.Tk):
         # 操作パネル
         self.control_frame = tk.Frame(self.main_frame)
         self.control_frame.pack(fill="x")
+        
+        # 表示モード選択
+        self.display_mode_frame = tk.Frame(self.control_frame)
+        self.display_mode_frame.pack(side="left", padx=5)
+        tk.Label(self.display_mode_frame, text="表示モード:").pack(side="left")
+        self.window_radio = tk.Radiobutton(
+            self.display_mode_frame, text="ウィンドウ", 
+            variable=self.display_mode, value="window"
+        )
+        self.window_radio.pack(side="left", padx=2)
+        self.fullscreen_radio = tk.Radiobutton(
+            self.display_mode_frame, text="フルスクリーン", 
+            variable=self.display_mode, value="fullscreen"
+        )
+        self.fullscreen_radio.pack(side="left", padx=2)
+        
         self.start_button = tk.Button(
             self.control_frame, text="ゲーム開始", command=self.start_game, state="disabled")
         self.start_button.pack(side="left", padx=5)
@@ -533,19 +618,24 @@ class App(tk.Tk):
         self.select_video_button.config(state="disabled")
         self.camera_menu.config(state="disabled")
         self.refresh_button.config(state="disabled")
+        self.window_radio.config(state="disabled")
+        self.fullscreen_radio.config(state="disabled")
         self.status_label.config(text="ゲームを開始しています...")
 
         self.game_state = GameState.PLAYING
         self.state_change_time = None
 
+        # 表示モードを取得
+        fullscreen = (self.display_mode.get() == "fullscreen")
+
         self.game_over_event = multiprocessing.Event()
         self.video_process = multiprocessing.Process(
             target=video_player_process,
-            args=(self.video_path, self.game_over_event)
+            args=(self.video_path, self.game_over_event, fullscreen)
         )
         self.video_process.start()
         self.status_label.config(text="ゲーム進行中... 笑わないで！")
-        logger.info("ゲームを開始しました")
+        logger.info(f"ゲームを開始しました (表示モード: {'フルスクリーン' if fullscreen else 'ウィンドウ'})")
 
     def update_webcam_feed(self):
         """Webカメラフィードの更新"""
@@ -670,6 +760,8 @@ class App(tk.Tk):
         self.select_video_button.config(state="normal")
         self.camera_menu.config(state="normal")
         self.refresh_button.config(state="normal")
+        self.window_radio.config(state="normal")
+        self.fullscreen_radio.config(state="normal")
         
         if self.video_process:
             if self.video_process.is_alive():
