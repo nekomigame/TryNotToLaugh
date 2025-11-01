@@ -34,6 +34,8 @@ CAMERA_SEARCH_RANGE = 10
 FRAME_SKIP_THRESHOLD = 100
 TEMP_DIR = "./temp"
 AUDIO_SYNC_OFFSET = 0.1  # 音声同期の補正オフセット（秒）
+SYNC_TOLERANCE_FRAMES = 2  # 同期許容フレーム数
+MAX_FRAME_WAIT_MS = 50  # 最大フレーム待機時間（ミリ秒）
 
 # 一時ディレクトリの作成
 if not os.path.exists(TEMP_DIR):
@@ -247,36 +249,49 @@ def video_player_process(video_path, game_over_event, fullscreen=False):
 
             # --- 再生ループ ---
             running = True
-            start_time = time.time()
-            audio_start_time = None  # 音声開始時刻を記録
+            playback_start_time = time.time()
+            audio_start_time = None
             video_ended = False
             audio_ended = False
-            last_sync_log_time = start_time
+            last_sync_log_time = playback_start_time
+            frame_duration = 1.0 / video_fps if video_fps > 0 else 0.033
 
             while running:
+                loop_start_time = time.time()
+                
                 if game_over_event.is_set():
                     logger.info("ゲームオーバーイベントを検出")
                     break
 
-                # --- 時間同期 ---
+                # --- 時間同期（音声を主軸とする）---
                 if audio_ready and pygame.mixer.music.get_busy():
-                    # 音声再生位置を基準にする
                     if audio_start_time is None:
                         audio_start_time = time.time()
-                    # get_pos()の遅延を補正
-                    audio_pos = pygame.mixer.music.get_pos() / 1000.0
-                    elapsed_since_start = time.time() - audio_start_time
-                    # 音声位置とシステム時刻の平均を取ることで安定化
-                    current_time = (audio_pos + elapsed_since_start) / 2.0
+                        logger.info("音声再生を開始しました")
+                    
+                    # 音声の再生位置を基準とする（最も信頼できる時刻源）
+                    audio_pos_ms = pygame.mixer.music.get_pos()
+                    if audio_pos_ms >= 0:
+                        current_time = audio_pos_ms / 1000.0
+                    else:
+                        # get_pos()が負の値を返す場合のフォールバック
+                        current_time = time.time() - audio_start_time
                 else:
                     if audio_ready and not audio_ended:
                         audio_ended = True
                         logger.info("音声の再生が終了しました")
-                    current_time = time.time() - start_time
+                    # 音声がない場合はシステム時刻を使用
+                    current_time = time.time() - playback_start_time
                 
                 # デバッグ用：5秒ごとに同期状況をログ
                 if time.time() - last_sync_log_time > 5.0:
-                    logger.debug(f"再生時刻: {current_time:.2f}秒 / {total_duration:.2f}秒")
+                    current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                    expected_frame = int(current_time * video_fps)
+                    frame_diff = abs(current_frame - expected_frame)
+                    logger.debug(
+                        f"同期状況 - 時刻: {current_time:.2f}s / {total_duration:.2f}s, "
+                        f"フレーム: {current_frame} / {expected_frame} (差: {frame_diff})"
+                    )
                     last_sync_log_time = time.time()
 
                 # --- 動画終了チェック ---
@@ -284,20 +299,21 @@ def video_player_process(video_path, game_over_event, fullscreen=False):
                     logger.info("動画の再生時間が終了しました")
                     break
 
-                # --- フレームのスキップ/読み込み ---
+                # --- フレーム同期とスキップ ---
                 target_frame_num = int(current_time * video_fps)
                 current_frame_num = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                frame_diff = target_frame_num - current_frame_num
 
-                if current_frame_num < target_frame_num:
-                    frame_diff = target_frame_num - current_frame_num
+                if frame_diff > SYNC_TOLERANCE_FRAMES:
+                    # 遅れている場合：フレームをスキップ
                     if frame_diff > FRAME_SKIP_THRESHOLD:
-                        # 大きなずれの場合は直接シーク
+                        # 大きな遅れの場合は直接シーク
                         cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_num)
-                        logger.debug(f"フレームシーク: {current_frame_num} -> {target_frame_num}")
+                        logger.debug(f"大幅な遅延を検出: {frame_diff}フレームシーク")
                     else:
-                        # 小さなずれの場合はフレームを読み飛ばす
+                        # 小さな遅れの場合はフレームを読み飛ばす
                         skip_count = 0
-                        while current_frame_num < target_frame_num:
+                        while current_frame_num < target_frame_num - 1:  # 1フレーム前まで
                             ret = cap.grab()
                             if not ret:
                                 video_ended = True
@@ -305,12 +321,19 @@ def video_player_process(video_path, game_over_event, fullscreen=False):
                             current_frame_num += 1
                             skip_count += 1
                         if skip_count > 0:
-                            logger.debug(f"{skip_count}フレームをスキップしました")
+                            logger.debug(f"{skip_count}フレームをスキップ (遅延: {frame_diff})")
+                elif frame_diff < -SYNC_TOLERANCE_FRAMES:
+                    # 進みすぎている場合：少し待機
+                    wait_time = abs(frame_diff) * frame_duration
+                    if wait_time > 0 and wait_time < MAX_FRAME_WAIT_MS / 1000.0:
+                        time.sleep(wait_time)
+                        logger.debug(f"進みすぎを検出: {wait_time*1000:.1f}ms待機")
 
                 if video_ended:
                     logger.info("動画フレームが終了しました")
                     break
 
+                # --- フレーム読み込み ---
                 ret, frame = cap.read()
                 if not ret:
                     logger.info("動画の読み込みが終了しました")
@@ -321,13 +344,11 @@ def video_player_process(video_path, game_over_event, fullscreen=False):
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     
                     if is_fullscreen:
-                        # フルスクリーンの場合はリサイズして中央配置
                         frame_resized = cv2.resize(frame_rgb, display_size)
                         surf = pygame.surfarray.make_surface(frame_resized.swapaxes(0, 1))
-                        screen.fill((0, 0, 0))  # 黒で背景を塗りつぶす
+                        screen.fill((0, 0, 0))
                         screen.blit(surf, (offset_x, offset_y))
                     else:
-                        # ウィンドウモードの場合はそのまま表示
                         surf = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
                         screen.blit(surf, (0, 0))
                     
@@ -346,7 +367,6 @@ def video_player_process(video_path, game_over_event, fullscreen=False):
                             running = False
                             game_over_event.set()
                         elif event.key == pygame.K_F11 or event.key == pygame.K_f:
-                            # フルスクリーン切り替え
                             is_fullscreen = not is_fullscreen
                             if is_fullscreen:
                                 screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
@@ -370,8 +390,15 @@ def video_player_process(video_path, game_over_event, fullscreen=False):
                                 offset_y = 0
                                 logger.info("ウィンドウモードに切り替え")
 
-                # フレームレートを制御（音声同期を優先）
-                clock.tick(video_fps * 1.5)
+                # フレームレートに基づいた待機時間の計算
+                elapsed = time.time() - loop_start_time
+                target_frame_time = frame_duration
+                sleep_time = target_frame_time - elapsed
+                
+                if sleep_time > 0.001:  # 1ms以上の場合のみスリープ
+                    time.sleep(sleep_time)
+                elif sleep_time < -0.010:  # 10ms以上遅れている場合は警告
+                    logger.debug(f"フレーム処理遅延: {-sleep_time*1000:.1f}ms")
 
             logger.info("動画再生ループを終了します")
 
