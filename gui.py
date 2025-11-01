@@ -33,6 +33,7 @@ WIN_DISPLAY_DURATION = 5.0
 CAMERA_SEARCH_RANGE = 10
 FRAME_SKIP_THRESHOLD = 100
 TEMP_DIR = "./temp"
+AUDIO_SYNC_OFFSET = 0.1  # 音声同期の補正オフセット（秒）
 
 # 一時ディレクトリの作成
 if not os.path.exists(TEMP_DIR):
@@ -45,6 +46,7 @@ class GameState(Enum):
     PLAYING = "playing"
     GAME_OVER = "game_over"
     WIN = "win"
+    ABORTED = "aborted"
 
 
 # --- Windowsにおける非ASCIIパスの問題に対するパッチ ---
@@ -214,8 +216,10 @@ def video_player_process(video_path, game_over_event):
             # --- 再生ループ ---
             running = True
             start_time = time.time()
+            audio_start_time = None  # 音声開始時刻を記録
             video_ended = False
             audio_ended = False
+            last_sync_log_time = start_time
 
             while running:
                 if game_over_event.is_set():
@@ -224,12 +228,24 @@ def video_player_process(video_path, game_over_event):
 
                 # --- 時間同期 ---
                 if audio_ready and pygame.mixer.music.get_busy():
-                    current_time = pygame.mixer.music.get_pos() / 1000.0
+                    # 音声再生位置を基準にする
+                    if audio_start_time is None:
+                        audio_start_time = time.time()
+                    # get_pos()の遅延を補正
+                    audio_pos = pygame.mixer.music.get_pos() / 1000.0
+                    elapsed_since_start = time.time() - audio_start_time
+                    # 音声位置とシステム時刻の平均を取ることで安定化
+                    current_time = (audio_pos + elapsed_since_start) / 2.0
                 else:
                     if audio_ready and not audio_ended:
                         audio_ended = True
                         logger.info("音声の再生が終了しました")
                     current_time = time.time() - start_time
+                
+                # デバッグ用：5秒ごとに同期状況をログ
+                if time.time() - last_sync_log_time > 5.0:
+                    logger.debug(f"再生時刻: {current_time:.2f}秒 / {total_duration:.2f}秒")
+                    last_sync_log_time = time.time()
 
                 # --- 動画終了チェック ---
                 if total_duration and current_time >= total_duration:
@@ -241,15 +257,23 @@ def video_player_process(video_path, game_over_event):
                 current_frame_num = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
 
                 if current_frame_num < target_frame_num:
-                    if target_frame_num - current_frame_num > FRAME_SKIP_THRESHOLD:
+                    frame_diff = target_frame_num - current_frame_num
+                    if frame_diff > FRAME_SKIP_THRESHOLD:
+                        # 大きなずれの場合は直接シーク
                         cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_num)
+                        logger.debug(f"フレームシーク: {current_frame_num} -> {target_frame_num}")
                     else:
+                        # 小さなずれの場合はフレームを読み飛ばす
+                        skip_count = 0
                         while current_frame_num < target_frame_num:
                             ret = cap.grab()
                             if not ret:
                                 video_ended = True
                                 break
                             current_frame_num += 1
+                            skip_count += 1
+                        if skip_count > 0:
+                            logger.debug(f"{skip_count}フレームをスキップしました")
 
                 if video_ended:
                     logger.info("動画フレームが終了しました")
@@ -274,8 +298,14 @@ def video_player_process(video_path, game_over_event):
                     if event.type == pygame.QUIT:
                         running = False
                         game_over_event.set()
+                    elif event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_ESCAPE:
+                            logger.info("ESCキーが押されました。ゲームを終了します")
+                            running = False
+                            game_over_event.set()
 
-                clock.tick(video_fps * 2)
+                # フレームレートを制御（音声同期を優先）
+                clock.tick(video_fps * 1.5)
 
             logger.info("動画再生ループを終了します")
 
@@ -359,6 +389,9 @@ class App(tk.Tk):
         self.status_label.pack(side="left", padx=5)
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # ESCキーでゲーム終了
+        self.bind("<Escape>", self.on_escape_key)
 
         self.init_face_detector()
         self.selected_camera.trace_add("write", self.on_camera_select)
@@ -584,13 +617,20 @@ class App(tk.Tk):
                 
                 if self.state_change_time and (time.time() - self.state_change_time > GAME_OVER_DISPLAY_DURATION):
                     self.reset_game_state()
-
+            
+            # ABORTED状態の場合は何も表示せずにリセット待ち
+            elif self.game_state == GameState.ABORTED:
+                # メッセージボックスが表示されるまで待機
+                pass
+            
+            # 動画終了チェック（PLAYING状態でのみ）
             elif self.video_process and not self.video_process.is_alive() and self.game_state == GameState.PLAYING:
+                # 動画が正常に終了し、かつゲーム中の場合のみWINにする
                 self.game_state = GameState.WIN
                 self.win_start_time = time.time()
                 logger.info("ユーザーが勝利しました")
 
-            if self.game_state == GameState.WIN:
+            elif self.game_state == GameState.WIN:
                 win_text = "YOU WIN!"
                 text_size = cv2.getTextSize(
                     win_text, cv2.FONT_HERSHEY_TRIPLEX, 3, 5)[0]
@@ -645,6 +685,24 @@ class App(tk.Tk):
         self.game_state = GameState.IDLE
         self.state_change_time = None
         self.win_start_time = None
+
+    def on_escape_key(self, event=None):
+        """ESCキーが押された時の処理"""
+        if self.game_state in [GameState.PLAYING, GameState.GAME_OVER, GameState.WIN]:
+            logger.info("ESCキーでゲームを中断します")
+            
+            # 状態をABORTEDに設定
+            self.game_state = GameState.ABORTED
+            
+            # ゲームオーバーイベントを設定して動画を停止
+            if self.game_over_event:
+                self.game_over_event.set()
+            
+            # メッセージボックスを表示
+            self.after(100, lambda: [
+                messagebox.showinfo("ゲーム中断", "ゲームを中断しました。"),
+                self.reset_game_state()
+            ])
 
     def on_closing(self):
         """アプリケーション終了時の処理"""
