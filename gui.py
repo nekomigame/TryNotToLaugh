@@ -13,6 +13,97 @@ warnings.filterwarnings('ignore',
                         message=r'.*tf\.lite\.Interpreter is deprecated.*',
                         category=UserWarning)
 
+# --- Windowsにおける非ASCIIパスの問題に対するパッチ ---
+import sys
+
+if sys.platform == 'win32':
+    # TensorFlow Lite や OpenCV などのライブラリが、
+    # Windows 上で非ASCII文字を含むパスからファイルを読み込めない問題を解決。
+
+    # 1. TensorFlow Lite モデルの読み込みに関するパッチ
+    try:
+        import tensorflow as tf
+        
+        original_interpreter_init = tf.lite.Interpreter.__init__
+
+        def new_interpreter_init(self, model_path=None, model_content=None, **kwargs):
+            if model_path and not model_content:
+                try:
+                    # パスがASCII文字のみで構成されている場合は、元のローダーに処理を任せる。
+                    model_path.encode('ascii')
+                except UnicodeEncodeError:
+                    # パスに非ASCII文字が含まれている場合は、その内容をそのまま渡す。
+                    try:
+                        with open(model_path, 'rb') as f:
+                            model_content = f.read()
+                        model_path = None # パスではなくコンテンツを使用する
+                    except Exception:
+                        # 失敗時は元の動作に戻す
+                        pass
+            original_interpreter_init(self, model_path=model_path, model_content=model_content, **kwargs)
+
+        tf.lite.Interpreter.__init__ = new_interpreter_init
+    except (ImportError, AttributeError):
+        # TensorFlowがインストールされていない、またはアクセスできない場合は無視
+        pass
+
+    # 2. OpenCVのCascadeClassifier読み込みに関するパッチ
+    try:
+        import cv2
+        import tempfile
+
+        _original_CascadeClassifier = cv2.CascadeClassifier
+
+        class CascadeClassifierWrapper:
+            """
+            非ASCIIパスを処理するためのcv2.CascadeClassifierのラッパー。
+            カスケードファイルを読み込むために、ASCIIパスに一時ファイルを作成。
+            """
+            def __init__(self, filename=None):
+                self._temp_file = None
+                self._classifier = None
+                if filename and isinstance(filename, str):
+                    try:
+                        filename.encode('ascii')
+                        self._classifier = _original_CascadeClassifier(filename)
+                    except UnicodeEncodeError:
+                        try:
+                            with open(filename, 'rb') as f:
+                                content = f.read()
+                            
+                            fd, temp_path = tempfile.mkstemp(suffix=".xml")
+                            with os.fdopen(fd, 'wb') as temp_f:
+                                temp_f.write(content)
+                            
+                            self._temp_file = temp_path
+                            self._classifier = _original_CascadeClassifier(self._temp_file)
+                        except Exception:
+                            # 失敗時は元の動作に戻す
+                            self._classifier = _original_CascadeClassifier(filename)
+                elif filename is None:
+                    self._classifier = _original_CascadeClassifier()
+                else:
+                    self._classifier = _original_CascadeClassifier(filename)
+
+
+            def __getattr__(self, name):
+                # すべてのメソッド/属性呼び出しをラップされたオブジェクトに転送する
+                return getattr(self._classifier, name)
+
+            def __del__(self):
+                # オブジェクトが破棄されるときに一時ファイルを削除する
+                if self._temp_file:
+                    try:
+                        os.remove(self._temp_file)
+                    except (OSError, AttributeError):
+                        pass
+        
+        cv2.CascadeClassifier = CascadeClassifierWrapper
+    except (ImportError, AttributeError):
+        # OpenCVがインストールされていない、またはアクセスできない場合は無視
+        pass
+# --- パッチ終了 ---
+
 from moviepy.editor import VideoFileClip
 import pygame
 from fer.fer import FER
