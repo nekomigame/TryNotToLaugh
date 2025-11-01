@@ -4,23 +4,53 @@ from tkinter import filedialog, messagebox
 import multiprocessing
 import os
 import time
+import logging
+from enum import Enum
+import uuid
+from contextlib import contextmanager
+
+# ロギング設定
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # OpenCVのログレベルを設定して、不要な警告を抑制
 os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
-# --- 警告を抑制 ---
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 warnings.filterwarnings('ignore',
                         message=r'.*tf\.lite\.Interpreter is deprecated.*',
                         category=UserWarning)
 
+# --- 定数定義 ---
+SMILE_THRESHOLD = 0.70
+FRAME_RESIZE_SCALE = 0.5
+VIDEO_PROCESS_TIMEOUT = 2.0
+WEBCAM_UPDATE_INTERVAL_MS = 15
+GAME_OVER_DISPLAY_DURATION = 5.0
+WIN_DISPLAY_DURATION = 5.0
+CAMERA_SEARCH_RANGE = 10
+FRAME_SKIP_THRESHOLD = 100
+TEMP_DIR = "./temp"
+
+# 一時ディレクトリの作成
+if not os.path.exists(TEMP_DIR):
+    os.makedirs(TEMP_DIR)
+
+
+class GameState(Enum):
+    """ゲーム状態を管理するEnum"""
+    IDLE = "idle"
+    PLAYING = "playing"
+    GAME_OVER = "game_over"
+    WIN = "win"
+
+
 # --- Windowsにおける非ASCIIパスの問題に対するパッチ ---
 import sys
 
 if sys.platform == 'win32':
-    # TensorFlow Lite や OpenCV などのライブラリが、
-    # Windows 上で非ASCII文字を含むパスからファイルを読み込めない問題を解決。
-
-    # 1. TensorFlow Lite モデルの読み込みに関するパッチ
     try:
         import tensorflow as tf
         
@@ -29,25 +59,21 @@ if sys.platform == 'win32':
         def new_interpreter_init(self, model_path=None, model_content=None, **kwargs):
             if model_path and not model_content:
                 try:
-                    # パスがASCII文字のみで構成されている場合は、元のローダーに処理を任せる。
                     model_path.encode('ascii')
                 except UnicodeEncodeError:
-                    # パスに非ASCII文字が含まれている場合は、その内容をそのまま渡す。
                     try:
                         with open(model_path, 'rb') as f:
                             model_content = f.read()
-                        model_path = None # パスではなくコンテンツを使用する
-                    except Exception:
-                        # 失敗時は元の動作に戻す
-                        pass
+                        model_path = None
+                        logger.info("非ASCIIパスを検出: モデルをメモリに読み込みました")
+                    except Exception as e:
+                        logger.warning(f"モデルの読み込みに失敗: {e}")
             original_interpreter_init(self, model_path=model_path, model_content=model_content, **kwargs)
 
         tf.lite.Interpreter.__init__ = new_interpreter_init
-    except (ImportError, AttributeError):
-        # TensorFlowがインストールされていない、またはアクセスできない場合は無視
-        pass
+    except (ImportError, AttributeError) as e:
+        logger.debug(f"TensorFlowパッチをスキップ: {e}")
 
-    # 2. OpenCVのCascadeClassifier読み込みに関するパッチ
     try:
         import cv2
         import tempfile
@@ -55,10 +81,6 @@ if sys.platform == 'win32':
         _original_CascadeClassifier = cv2.CascadeClassifier
 
         class CascadeClassifierWrapper:
-            """
-            非ASCIIパスを処理するためのcv2.CascadeClassifierのラッパー。
-            カスケードファイルを読み込むために、ASCIIパスに一時ファイルを作成。
-            """
             def __init__(self, filename=None):
                 self._temp_file = None
                 self._classifier = None
@@ -77,173 +99,196 @@ if sys.platform == 'win32':
                             
                             self._temp_file = temp_path
                             self._classifier = _original_CascadeClassifier(self._temp_file)
-                        except Exception:
-                            # 失敗時は元の動作に戻す
+                            logger.info("非ASCIIパスを検出: カスケードファイルを一時ファイルにコピーしました")
+                        except Exception as e:
+                            logger.warning(f"カスケードファイルの読み込みに失敗: {e}")
                             self._classifier = _original_CascadeClassifier(filename)
                 elif filename is None:
                     self._classifier = _original_CascadeClassifier()
                 else:
                     self._classifier = _original_CascadeClassifier(filename)
 
-
             def __getattr__(self, name):
-                # すべてのメソッド/属性呼び出しをラップされたオブジェクトに転送する
                 return getattr(self._classifier, name)
 
             def __del__(self):
-                # オブジェクトが破棄されるときに一時ファイルを削除する
                 if self._temp_file:
                     try:
                         os.remove(self._temp_file)
-                    except (OSError, AttributeError):
-                        pass
+                    except (OSError, AttributeError) as e:
+                        logger.debug(f"一時ファイルの削除に失敗: {e}")
         
         cv2.CascadeClassifier = CascadeClassifierWrapper
-    except (ImportError, AttributeError):
-        # OpenCVがインストールされていない、またはアクセスできない場合は無視
-        pass
-# --- パッチ終了 ---
-
-from moviepy.editor import VideoFileClip
-import pygame
-from fer.fer import FER
-from PIL import Image, ImageTk
-import cv2
+    except (ImportError, AttributeError) as e:
+        logger.debug(f"OpenCVパッチをスキップ: {e}")
 
 
-# --- デフォルト設定 ---
-SMILE_THRESHOLD = 0.70
-
-# このディレクトリが存在しない場合は作成されます。
-if not os.path.exists("./temp"):
-    os.makedirs("./temp")
+@contextmanager
+def temporary_audio_file():
+    """一時音声ファイルを安全に管理するコンテキストマネージャー"""
+    temp_file = os.path.join(TEMP_DIR, f"temp_audio_{uuid.uuid4()}.mp3")
+    try:
+        yield temp_file
+    finally:
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+                logger.debug(f"一時ファイルを削除: {temp_file}")
+            except Exception as e:
+                logger.warning(f"一時ファイルの削除に失敗: {e}")
 
 
 def video_player_process(video_path, game_over_event):
     """
     PygameとOpenCVを使用して別のプロセスで動画を再生します。
-    Moviepyは音声抽出にのみ使用します。
     """
-    temp_audio_file = f"./temp/temp_audio_{os.getpid()}.mp3"
+    import pygame
+    import cv2
+    from moviepy.editor import VideoFileClip
+    
+    # Pygame初期化
+    pygame.init()
+    
     cap = None
-    video_fps = 30  # デフォルト値
-    video_size = (640, 480)  # デフォルト値
+    video_fps = 30
+    video_size = (640, 480)
 
-    try:
-        if not os.path.exists(video_path):
-            print(f"動画ファイルが見つかりません: {video_path}")
-            game_over_event.set()
-            return
-
-        # --- 音声抽出 (Moviepy) ---
+    with temporary_audio_file() as temp_audio_file:
         try:
-            with VideoFileClip(video_path) as clip:
-                if clip.audio:
-                    clip.audio.write_audiofile(
-                        temp_audio_file, codec='mp3', logger=None)
-                video_fps = clip.fps
-                video_size = clip.size
-        except Exception as e:
-            print(f"Moviepyでの動画情報取得または音声抽出に失敗: {e}")
-            # Moviepyが失敗しても、OpenCVで試行を続ける
+            if not os.path.exists(video_path):
+                logger.error(f"動画ファイルが見つかりません: {video_path}")
+                game_over_event.set()
+                return
 
-        # --- OpenCVでのビデオキャプチャ準備 ---
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"OpenCVで動画ファイルを開けませんでした: {video_path}")
-            game_over_event.set()
-            return
-
-        # Moviepyがプロパティを取得できなかった場合、OpenCVから取得
-        if video_fps is None or video_fps == 0:
-            video_fps = cap.get(cv2.CAP_PROP_FPS)
-        if video_size is None or video_size[0] == 0:
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            video_size = (width, height)
-
-        # --- Pygameのセットアップ ---
-        pygame.display.set_caption("笑ってはいけないチャレンジ - 動画")
-        screen = pygame.display.set_mode(video_size)
-        clock = pygame.time.Clock()
-
-        # --- 音声再生のセットアップ ---
-        has_audio = os.path.exists(
-            temp_audio_file) and os.path.getsize(temp_audio_file) > 0
-        if has_audio:
-            pygame.mixer.init()
-            pygame.mixer.music.load(temp_audio_file)
-            pygame.mixer.music.play()
-
-        # --- 再生ループ ---
-        running = True
-        start_time = time.time()
-
-        while running:
-            if game_over_event.is_set():
-                break
-
-            # --- 時間同期 ---
-            if has_audio and pygame.mixer.music.get_busy():
-                current_time = pygame.mixer.music.get_pos() / 1000.0
-            else:
-                if has_audio:  # 音声がちょうど終了した
-                    break
-                current_time = time.time() - start_time
-
-            # --- フレームのスキップ/読み込み ---
-            target_frame_num = int(current_time * video_fps)
-
-            # OpenCVのフレーム位置設定は正確でない場合があるため、手動で同期
-            # 現在のフレーム番号を取得
-            current_frame_num = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-
-            # ターゲットフレームに追いつくまでフレームを読み飛ばす
-            if current_frame_num < target_frame_num:
-                # 差が大きすぎる場合は直接シークする（パフォーマンスのため）
-                if target_frame_num - current_frame_num > 100:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_num)
-                else:
-                    while current_frame_num < target_frame_num:
-                        ret, frame = cap.read()
-                        if not ret:
-                            break
-                        current_frame_num += 1
-
-            ret, frame = cap.read()
-            if not ret:
-                break  # 動画の終端
-
-            # --- フレーム表示 ---
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            surf = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
-            screen.blit(surf, (0, 0))
-            pygame.display.flip()
-
-            # ウィンドウイベントの処理
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-                    game_over_event.set()
-
-            # FPSを維持しようと試みるが、同期が優先
-            clock.tick(video_fps * 2)  # 同期のため少し高めに設定
-
-    except Exception as e:
-        import traceback
-        print(f"動画プロセスで予期せぬエラーが発生しました: {e}")
-        traceback.print_exc()
-        game_over_event.set()
-    finally:
-        if cap:
-            cap.release()
-        pygame.quit()
-        if os.path.exists(temp_audio_file):
+            # --- 音声抽出 (Moviepy) ---
+            has_audio = False
             try:
-                os.remove(temp_audio_file)
+                with VideoFileClip(video_path) as clip:
+                    if clip.audio:
+                        clip.audio.write_audiofile(
+                            temp_audio_file, codec='mp3', logger=None)
+                        has_audio = True
+                    video_fps = clip.fps if clip.fps else 30
+                    video_size = clip.size if clip.size else (640, 480)
+                    total_duration = clip.duration
+                logger.info(f"動画情報取得成功: FPS={video_fps}, サイズ={video_size}, 音声={has_audio}")
             except Exception as e:
-                print(f"一時音声ファイルの削除に失敗しました: {e}")
-        print("動画再生プロセスが終了しました。")
+                logger.warning(f"Moviepyでの処理に失敗: {e}")
+                total_duration = None
+
+            # --- OpenCVでのビデオキャプチャ準備 ---
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                logger.error(f"OpenCVで動画ファイルを開けませんでした: {video_path}")
+                game_over_event.set()
+                return
+
+            # OpenCVから情報を取得（Moviepyが失敗した場合のフォールバック）
+            if video_fps == 0:
+                video_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            if video_size[0] == 0:
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                video_size = (width, height) if width > 0 else (640, 480)
+            if total_duration is None:
+                frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                total_duration = frame_count / video_fps if video_fps > 0 else 0
+
+            # --- Pygameのセットアップ ---
+            pygame.display.set_caption("笑ってはいけないチャレンジ - 動画")
+            screen = pygame.display.set_mode(video_size)
+            clock = pygame.time.Clock()
+
+            # --- 音声再生のセットアップ ---
+            audio_ready = False
+            if has_audio and os.path.exists(temp_audio_file) and os.path.getsize(temp_audio_file) > 0:
+                try:
+                    pygame.mixer.init()
+                    pygame.mixer.music.load(temp_audio_file)
+                    pygame.mixer.music.play()
+                    audio_ready = True
+                    logger.info("音声再生を開始しました")
+                except Exception as e:
+                    logger.warning(f"音声の初期化に失敗: {e}")
+
+            # --- 再生ループ ---
+            running = True
+            start_time = time.time()
+            video_ended = False
+            audio_ended = False
+
+            while running:
+                if game_over_event.is_set():
+                    logger.info("ゲームオーバーイベントを検出")
+                    break
+
+                # --- 時間同期 ---
+                if audio_ready and pygame.mixer.music.get_busy():
+                    current_time = pygame.mixer.music.get_pos() / 1000.0
+                else:
+                    if audio_ready and not audio_ended:
+                        audio_ended = True
+                        logger.info("音声の再生が終了しました")
+                    current_time = time.time() - start_time
+
+                # --- 動画終了チェック ---
+                if total_duration and current_time >= total_duration:
+                    logger.info("動画の再生時間が終了しました")
+                    break
+
+                # --- フレームのスキップ/読み込み ---
+                target_frame_num = int(current_time * video_fps)
+                current_frame_num = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+
+                if current_frame_num < target_frame_num:
+                    if target_frame_num - current_frame_num > FRAME_SKIP_THRESHOLD:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_num)
+                    else:
+                        while current_frame_num < target_frame_num:
+                            ret = cap.grab()
+                            if not ret:
+                                video_ended = True
+                                break
+                            current_frame_num += 1
+
+                if video_ended:
+                    logger.info("動画フレームが終了しました")
+                    break
+
+                ret, frame = cap.read()
+                if not ret:
+                    logger.info("動画の読み込みが終了しました")
+                    break
+
+                # --- フレーム表示 ---
+                try:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    surf = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
+                    screen.blit(surf, (0, 0))
+                    pygame.display.flip()
+                except Exception as e:
+                    logger.error(f"フレーム描画エラー: {e}")
+
+                # ウィンドウイベントの処理
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        running = False
+                        game_over_event.set()
+
+                clock.tick(video_fps * 2)
+
+            logger.info("動画再生ループを終了します")
+
+        except Exception as e:
+            import traceback
+            logger.error(f"動画プロセスで予期せぬエラーが発生: {e}")
+            logger.error(traceback.format_exc())
+            game_over_event.set()
+        finally:
+            if cap:
+                cap.release()
+            pygame.quit()
+            logger.info("動画再生プロセスが終了しました")
 
 
 class App(tk.Tk):
@@ -252,23 +297,29 @@ class App(tk.Tk):
         self.title("笑ってはいけないチャレンジ")
         self.geometry("800x700")
 
+        # 状態管理
+        self.game_state = GameState.IDLE
+        self.state_change_time = None
+        self.win_start_time = None  # 初期化を追加
+        
+        # リソース管理
         self.video_path = None
         self.game_over_event = None
         self.video_process = None
         self.detector = None
         self.cap_webcam = None
-        self.game_over = False
-        self.game_over_time = None
-        self.user_wins = False
         self.camera_list = []
         self.selected_camera = tk.StringVar()
+        
+        # フィード更新制御
         self._is_updating_feed = False
+        self._feed_update_id = None
 
         # --- GUIウィジェット ---
         self.main_frame = tk.Frame(self)
         self.main_frame.pack(padx=10, pady=10, fill="both", expand=True)
 
-        # --- 上部パネル (動画とカメラ選択) ---
+        # --- 上部パネル ---
         self.top_panel = tk.Frame(self.main_frame)
         self.top_panel.pack(fill="x", pady=5)
 
@@ -283,8 +334,7 @@ class App(tk.Tk):
 
         # カメラ選択
         self.webcam_frame = tk.Frame(self.top_panel)
-        self.webcam_frame.pack(side="left", fill="x",
-                               expand=True, padx=(10, 0))
+        self.webcam_frame.pack(side="left", fill="x", expand=True, padx=(10, 0))
         self.webcam_label = tk.Label(self.webcam_frame, text="Webカメラ:")
         self.webcam_label.pack(side="left", padx=5)
         self.camera_menu = tk.OptionMenu(
@@ -311,27 +361,34 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
         self.init_face_detector()
-
-        # カメラのセットアップ
         self.selected_camera.trace_add("write", self.on_camera_select)
         self.find_and_update_cameras()
 
     def init_face_detector(self):
+        """顔検出器の初期化"""
         try:
-            self.status_label.config(
-                text="顔検出器を初期化しています (mtcnn)...")
+            self.status_label.config(text="顔検出器を初期化しています (mtcnn)...")
             self.update()
+            from fer.fer import FER
             self.detector = FER(mtcnn=True)
+            logger.info("FER検出器をMTCNNで初期化しました")
         except Exception as e:
-            self.status_label.config(
-                text=f"mtcnnの初期化に失敗: {e}。mtcnnなしで再試行します。")
-            self.update()
-            self.detector = FER(mtcnn=False)
+            logger.warning(f"MTCNNの初期化に失敗: {e}")
+            try:
+                self.status_label.config(text="mtcnnなしで再試行しています...")
+                self.update()
+                from fer.fer import FER
+                self.detector = FER(mtcnn=False)
+                logger.info("FER検出器をMTCNNなしで初期化しました")
+            except Exception as e2:
+                logger.error(f"顔検出器の初期化に完全に失敗: {e2}")
+                messagebox.showerror("エラー", f"顔検出器の初期化に失敗しました: {e2}")
+                return
         self.status_label.config(text="顔検出器の準備ができました。")
 
     def find_and_update_cameras(self):
-        self.status_label.config(
-            text="利用可能なWebカメラを検索中...検索中はUIがフリーズする可能性があります。")
+        """利用可能なカメラを検索"""
+        self.status_label.config(text="利用可能なWebカメラを検索中...")
         self.update()
 
         if self.cap_webcam and self.cap_webcam.isOpened():
@@ -339,11 +396,15 @@ class App(tk.Tk):
             self.cap_webcam = None
 
         self.camera_list = []
-        for i in range(10):
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                self.camera_list.append(f"カメラ {i}")
+        for i in range(CAMERA_SEARCH_RANGE):
+            try:
+                cap = cv2.VideoCapture(i)
+                if cap.isOpened():
+                    self.camera_list.append(f"カメラ {i}")
+                    logger.info(f"カメラ {i} を検出しました")
                 cap.release()
+            except Exception as e:
+                logger.debug(f"カメラ {i} のチェックでエラー: {e}")
 
         menu = self.camera_menu["menu"]
         menu.delete(0, "end")
@@ -354,45 +415,67 @@ class App(tk.Tk):
                     label=cam, command=lambda value=cam: self.selected_camera.set(value))
             self.selected_camera.set(self.camera_list[0])
             self.status_label.config(text="Webカメラを選択してください。")
+            logger.info(f"{len(self.camera_list)}台のカメラを検出しました")
         else:
             self.selected_camera.set("")
             messagebox.showerror("エラー", "利用可能なWebカメラが見つかりませんでした。")
             self.status_label.config(text="エラー: Webカメラが見つかりません。")
+            logger.warning("利用可能なカメラが見つかりませんでした")
+        
         self.check_start_button_state()
 
     def on_camera_select(self, *args):
+        """カメラ選択時のハンドラ"""
         selection = self.selected_camera.get()
         if not selection:
             return
 
-        camera_index = int(selection.split(" ")[1])
-        self.initialize_capture(camera_index)
+        try:
+            camera_index = int(selection.split(" ")[1])
+            self.initialize_capture(camera_index)
+        except (ValueError, IndexError) as e:
+            logger.error(f"カメラインデックスの解析に失敗: {e}")
 
     def initialize_capture(self, camera_index):
+        """カメラキャプチャの初期化"""
+        # 既存のフィード更新をキャンセル
+        if self._feed_update_id:
+            self.after_cancel(self._feed_update_id)
+            self._feed_update_id = None
+        self._is_updating_feed = False
+
         if self.cap_webcam and self.cap_webcam.isOpened():
             self.cap_webcam.release()
 
-        self.cap_webcam = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        try:
+            import cv2
+            self.cap_webcam = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
 
-        if self.cap_webcam.isOpened():
-            self.status_label.config(text=f"Webカメラ {camera_index} を使用中。")
-            if not self._is_updating_feed:
-                self._is_updating_feed = True
-                self.update_webcam_feed()
-        else:
+            if self.cap_webcam.isOpened():
+                self.status_label.config(text=f"Webカメラ {camera_index} を使用中。")
+                logger.info(f"カメラ {camera_index} を初期化しました")
+                if not self._is_updating_feed:
+                    self._is_updating_feed = True
+                    self.update_webcam_feed()
+            else:
+                raise RuntimeError(f"カメラ {camera_index} を開けませんでした")
+        except Exception as e:
+            logger.error(f"カメラの初期化に失敗: {e}")
             messagebox.showerror("エラー", f"Webカメラ {camera_index} を開けませんでした。")
-            self.status_label.config(
-                text=f"エラー: Webカメラ {camera_index} を開けません。")
+            self.status_label.config(text=f"エラー: Webカメラ {camera_index} を開けません。")
             self.cap_webcam = None
+        
         self.check_start_button_state()
 
     def check_start_button_state(self):
+        """スタートボタンの有効/無効を制御"""
         if self.video_path and self.cap_webcam and self.cap_webcam.isOpened():
             self.start_button.config(state="normal")
         else:
             self.start_button.config(state="disabled")
 
     def select_video(self):
+        """動画ファイルの選択"""
         path = filedialog.askopenfilename(
             title="動画ファイルを選択",
             filetypes=(("MP4ファイル", "*.mp4"), ("すべてのファイル", "*.*"))
@@ -401,9 +484,11 @@ class App(tk.Tk):
             self.video_path = path
             self.video_label.config(text=os.path.basename(path))
             self.status_label.config(text="動画が選択されました。")
+            logger.info(f"動画を選択: {path}")
             self.check_start_button_state()
 
     def start_game(self):
+        """ゲームを開始"""
         if not self.video_path:
             messagebox.showwarning("警告", "最初に動画ファイルを選択してください。")
             return
@@ -417,139 +502,199 @@ class App(tk.Tk):
         self.refresh_button.config(state="disabled")
         self.status_label.config(text="ゲームを開始しています...")
 
-        self.game_over = False
-        self.user_wins = False
-        self.game_over_time = None
+        self.game_state = GameState.PLAYING
+        self.state_change_time = None
 
         self.game_over_event = multiprocessing.Event()
         self.video_process = multiprocessing.Process(
-            target=video_player_process, args=(
-                self.video_path, self.game_over_event)
+            target=video_player_process,
+            args=(self.video_path, self.game_over_event)
         )
         self.video_process.start()
         self.status_label.config(text="ゲーム進行中... 笑わないで！")
+        logger.info("ゲームを開始しました")
 
     def update_webcam_feed(self):
+        """Webカメラフィードの更新"""
+        if not self._is_updating_feed:
+            return
+
         if not self.cap_webcam or not self.cap_webcam.isOpened():
             self._is_updating_feed = False
             return
 
-        ret, frame = self.cap_webcam.read()
-        if not ret:
-            self.status_label.config(
-                text="エラー: Webカメラからフレームを取得できません。")
-            self.after(100, self.update_webcam_feed)
-            return
+        try:
+            import cv2
+            from PIL import Image, ImageTk
+            
+            ret, frame = self.cap_webcam.read()
+            if not ret:
+                logger.warning("Webカメラからフレームを取得できません")
+                self._feed_update_id = self.after(100, self.update_webcam_feed)
+                return
 
-        # --- ゲームロジック ---
-        if self.video_process and self.video_process.is_alive():
-            if not self.game_over:
-                try:
-                    small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
-                    results = self.detector.detect_emotions(small_frame)
+            # --- ゲームロジック ---
+            if self.video_process and self.video_process.is_alive():
+                if self.game_state == GameState.PLAYING:
+                    try:
+                        small_frame = cv2.resize(
+                            frame, (0, 0),
+                            fx=FRAME_RESIZE_SCALE,
+                            fy=FRAME_RESIZE_SCALE
+                        )
+                        results = self.detector.detect_emotions(small_frame)
 
-                    for result in results:
-                        x, y, w, h = [v * 2 for v in result['box']]
-                        emotions = result['emotions']
-                        smile_score = emotions.get('happy', 0)
+                        scale_factor = 1.0 / FRAME_RESIZE_SCALE
+                        for result in results:
+                            x, y, w, h = [int(v * scale_factor) for v in result['box']]
+                            emotions = result['emotions']
+                            smile_score = emotions.get('happy', 0)
 
-                        if smile_score > SMILE_THRESHOLD:
-                            label = f"笑顔！ ({smile_score:.2f})"
-                            color = (0, 255, 0)
-                            self.game_over = True
-                            self.game_over_time = time.time()
-                            self.game_over_event.set()
-                        else:
-                            dominant_emotion = max(emotions, key=emotions.get)
-                            label = dominant_emotion
-                            color = (0, 0, 255)
+                            if smile_score > SMILE_THRESHOLD:
+                                label = f"笑顔！ ({smile_score:.2f})"
+                                color = (0, 255, 0)
+                                self.game_state = GameState.GAME_OVER
+                                self.state_change_time = time.time()
+                                self.game_over_event.set()
+                                logger.info(f"笑顔を検出: スコア={smile_score:.2f}")
+                            else:
+                                dominant_emotion = max(emotions, key=emotions.get)
+                                label = dominant_emotion
+                                color = (0, 0, 255)
 
-                        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-                        cv2.putText(frame, label, (x, y - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+                            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                            cv2.putText(frame, label, (x, y - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
-                        if self.game_over:
-                            break
-                except Exception:
-                    pass
+                            if self.game_state == GameState.GAME_OVER:
+                                break
+                    except Exception as e:
+                        logger.error(f"感情検出エラー: {e}")
 
-        # --- ゲームオーバー/勝利表示 ---
-        if self.game_over:
-            out_text = "OUT!"
-            text_size = cv2.getTextSize(
-                out_text, cv2.FONT_HERSHEY_TRIPLEX, 5, 10)[0]
-            text_x = (frame.shape[1] - text_size[0]) // 2
-            text_y = (frame.shape[0] + text_size[1]) // 2
-            cv2.putText(frame, out_text, (text_x, text_y),
-                        cv2.FONT_HERSHEY_TRIPLEX, 5, (0, 0, 255), 10)
-            self.status_label.config(text="笑いましたね！ゲームオーバーです。")
-            if self.game_over_time and (time.time() - self.game_over_time > 5):
-                self.reset_game_state()
+            # --- 状態遷移チェック ---
+            if self.game_state == GameState.GAME_OVER:
+                out_text = "OUT!"
+                text_size = cv2.getTextSize(
+                    out_text, cv2.FONT_HERSHEY_TRIPLEX, 5, 10)[0]
+                text_x = (frame.shape[1] - text_size[0]) // 2
+                text_y = (frame.shape[0] + text_size[1]) // 2
+                cv2.putText(frame, out_text, (text_x, text_y),
+                            cv2.FONT_HERSHEY_TRIPLEX, 5, (0, 0, 255), 10)
+                self.status_label.config(text="笑いましたね！ゲームオーバーです。")
+                
+                if self.state_change_time and (time.time() - self.state_change_time > GAME_OVER_DISPLAY_DURATION):
+                    self.reset_game_state()
 
-        if self.video_process and not self.video_process.is_alive() and not self.game_over and not self.user_wins:
-            self.user_wins = True
-            self.win_start_time = time.time()
+            elif self.video_process and not self.video_process.is_alive() and self.game_state == GameState.PLAYING:
+                self.game_state = GameState.WIN
+                self.win_start_time = time.time()
+                logger.info("ユーザーが勝利しました")
 
-        if self.user_wins:
-            win_text = "YOU WIN!"
-            text_size = cv2.getTextSize(
-                win_text, cv2.FONT_HERSHEY_TRIPLEX, 3, 5)[0]
-            text_x = (frame.shape[1] - text_size[0]) // 2
-            text_y = (frame.shape[0] + text_size[1]) // 2
-            cv2.putText(frame, win_text, (text_x, text_y),
-                        cv2.FONT_HERSHEY_TRIPLEX, 3, (0, 255, 0), 5)
-            self.status_label.config(text="おめでとうございます！あなたの勝ちです！")
-            if time.time() - self.win_start_time > 5:
-                self.reset_game_state()
+            if self.game_state == GameState.WIN:
+                win_text = "YOU WIN!"
+                text_size = cv2.getTextSize(
+                    win_text, cv2.FONT_HERSHEY_TRIPLEX, 3, 5)[0]
+                text_x = (frame.shape[1] - text_size[0]) // 2
+                text_y = (frame.shape[0] + text_size[1]) // 2
+                cv2.putText(frame, win_text, (text_x, text_y),
+                            cv2.FONT_HERSHEY_TRIPLEX, 3, (0, 255, 0), 5)
+                self.status_label.config(text="おめでとうございます！あなたの勝ちです！")
+                
+                if self.win_start_time and (time.time() - self.win_start_time > WIN_DISPLAY_DURATION):
+                    self.reset_game_state()
 
-        # --- Tkinterキャンバスにフレームを表示 ---
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(frame)
+            # --- フレーム表示 ---
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame)
 
-        canvas_w = self.webcam_canvas.winfo_width()
-        canvas_h = self.webcam_canvas.winfo_height()
-        if canvas_w > 1 and canvas_h > 1:
-            img.thumbnail((canvas_w, canvas_h), Image.Resampling.LANCZOS)
+            canvas_w = self.webcam_canvas.winfo_width()
+            canvas_h = self.webcam_canvas.winfo_height()
+            if canvas_w > 1 and canvas_h > 1:
+                img.thumbnail((canvas_w, canvas_h), Image.Resampling.LANCZOS)
 
-        self.photo = ImageTk.PhotoImage(image=img)
-        self.webcam_canvas.create_image(
-            canvas_w/2, canvas_h/2, image=self.photo, anchor="center")
+            self.photo = ImageTk.PhotoImage(image=img)
+            self.webcam_canvas.create_image(
+                canvas_w/2, canvas_h/2, image=self.photo, anchor="center")
 
-        self.after(15, self.update_webcam_feed)
+        except Exception as e:
+            logger.error(f"Webカメラフィード更新エラー: {e}")
+
+        self._feed_update_id = self.after(WEBCAM_UPDATE_INTERVAL_MS, self.update_webcam_feed)
 
     def reset_game_state(self):
+        """ゲーム状態をリセット"""
+        logger.info("ゲーム状態をリセットします")
         self.status_label.config(
             text="ゲーム終了。もう一度プレイするには動画を選択してください。")
         self.start_button.config(state="normal")
         self.select_video_button.config(state="normal")
         self.camera_menu.config(state="normal")
         self.refresh_button.config(state="normal")
+        
         if self.video_process:
             if self.video_process.is_alive():
+                logger.info("動画プロセスを終了します")
                 self.video_process.terminate()
-            self.video_process.join()
+                self.video_process.join(timeout=VIDEO_PROCESS_TIMEOUT)
+                if self.video_process.is_alive():
+                    logger.warning("動画プロセスが応答しません。強制終了します")
+                    self.video_process.kill()
+                    self.video_process.join(timeout=1.0)
             self.video_process = None
-        self.game_over = False
-        self.user_wins = False
-        self.game_over_time = None
+        
+        self.game_state = GameState.IDLE
+        self.state_change_time = None
+        self.win_start_time = None
 
     def on_closing(self):
+        """アプリケーション終了時の処理"""
         if messagebox.askokcancel("終了", "終了しますか？"):
+            logger.info("アプリケーションを終了します")
+            
+            # フィード更新を停止
+            if self._feed_update_id:
+                self.after_cancel(self._feed_update_id)
+                self._feed_update_id = None
+            self._is_updating_feed = False
+            
+            # ゲームオーバーイベントを設定
             if self.game_over_event:
                 self.game_over_event.set()
+            
+            # 動画プロセスを終了
             if self.video_process:
                 if self.video_process.is_alive():
+                    logger.info("動画プロセスを終了しています...")
                     self.video_process.terminate()
-                self.video_process.join(timeout=1.0)
+                    self.video_process.join(timeout=VIDEO_PROCESS_TIMEOUT)
+                    
+                    if self.video_process.is_alive():
+                        logger.warning("動画プロセスが応答しません。強制終了します")
+                        self.video_process.kill()
+                        self.video_process.join(timeout=1.0)
+                        
+                        if self.video_process.is_alive():
+                            logger.error("動画プロセスを終了できませんでした")
+            
+            # Webカメラを解放
             if self.cap_webcam:
+                logger.info("Webカメラを解放します")
                 self.cap_webcam.release()
+            
             self.destroy()
+            logger.info("アプリケーションが正常に終了しました")
 
 
 def run():
+    """アプリケーションのエントリーポイント"""
     multiprocessing.freeze_support()
-    app = App()
-    app.mainloop()
+    logger.info("アプリケーションを起動します")
+    try:
+        app = App()
+        app.mainloop()
+    except Exception as e:
+        logger.critical(f"致命的なエラーが発生しました: {e}", exc_info=True)
+        raise
 
 
 if __name__ == '__main__':
