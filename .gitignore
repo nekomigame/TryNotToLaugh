@@ -2,3 +2,5 @@
 /build
 /temp
 /__pycache__
+/gui.dist
+/gui.build
