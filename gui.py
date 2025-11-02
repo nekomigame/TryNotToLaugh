@@ -24,19 +24,9 @@ warnings.filterwarnings('ignore',
                         message=r'.*tf\.lite\.Interpreter is deprecated.*',
                         category=UserWarning)
 
-# --- 定数定義 ---
-SMILE_THRESHOLD = 0.70
-FRAME_RESIZE_SCALE = 0.5
-VIDEO_PROCESS_TIMEOUT = 2.0
-WEBCAM_UPDATE_INTERVAL_MS = 15
-GAME_OVER_DISPLAY_DURATION = 5.0
-WIN_DISPLAY_DURATION = 5.0
-CAMERA_SEARCH_RANGE = 10
-FRAME_SKIP_THRESHOLD = 100
+# --- 定数定義 (変更されないもの) ---
 TEMP_DIR = "./temp"
-AUDIO_SYNC_OFFSET = 0.1  # 音声同期の補正オフセット（秒）
-SYNC_TOLERANCE_FRAMES = 2  # 同期許容フレーム数
-MAX_FRAME_WAIT_MS = 50  # 最大フレーム待機時間（ミリ秒）
+AUDIO_SYNC_OFFSET = 0.1  # 音声同期の補正オフセット（秒） (現在は未使用)
 
 # 一時ディレクトリの作成
 if not os.path.exists(TEMP_DIR):
@@ -192,7 +182,10 @@ def is_cache_valid(video_path, cache_path):
         return False
 
 
-def video_player_process(video_path, game_over_event, video_ready_event, fullscreen=False):
+def video_player_process(video_path, game_over_event, video_ready_event, fullscreen=False,
+                         frame_skip_threshold=100, 
+                         sync_tolerance_frames=2, 
+                         max_frame_wait_ms=50):
     """
     PygameとOpenCVを使用して別のプロセスで動画を再生します。
     """
@@ -281,6 +274,10 @@ def video_player_process(video_path, game_over_event, video_ready_event, fullscr
             print(f"[動画処理] 警告: Moviepyでの処理に失敗しました: {e}")
             total_duration = None # 失敗した場合はNoneに戻す
 
+        # --- ★★★ 修正箇所 ★★★ ---
+        # 以下の処理が `except` ブロックの中に入ってしまっていたため、
+        # Moviepyが成功すると実行されない問題があった。
+        # インデントを修正し、`try...except` の外（ただし外側の `try` の中）に移動。
 
         # --- OpenCVでのビデオキャプチャ準備 ---
         print("[動画処理] 動画ファイルを開いています...")
@@ -418,9 +415,9 @@ def video_player_process(video_path, game_over_event, video_ready_event, fullscr
             current_frame_num = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
             frame_diff = target_frame_num - current_frame_num
 
-            if frame_diff > SYNC_TOLERANCE_FRAMES:
+            if frame_diff > sync_tolerance_frames:
                 # 遅れている場合：フレームをスキップ
-                if frame_diff > FRAME_SKIP_THRESHOLD:
+                if frame_diff > frame_skip_threshold:
                     # 大きな遅れの場合は直接シーク
                     cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame_num)
                     logger.debug(f"大幅な遅延を検出: {frame_diff}フレームシーク")
@@ -434,12 +431,12 @@ def video_player_process(video_path, game_over_event, video_ready_event, fullscr
                             break
                         current_frame_num += 1
                         skip_count += 1
-                    if skip_count > 0:
-                        logger.debug(f"{skip_count}フレームをスキップ (遅延: {frame_diff})")
-            elif frame_diff < -SYNC_TOLERANCE_FRAMES:
+                        if skip_count > 0:
+                            logger.debug(f"{skip_count}フレームをスキップ (遅延: {frame_diff})")
+            elif frame_diff < -sync_tolerance_frames:
                 # 進みすぎている場合：少し待機
                 wait_time = abs(frame_diff) * frame_duration
-                if wait_time > 0 and wait_time < MAX_FRAME_WAIT_MS / 1000.0:
+                if wait_time > 0 and wait_time < max_frame_wait_ms / 1000.0:
                     time.sleep(wait_time)
                     logger.debug(f"進みすぎを検出: {wait_time*1000:.1f}ms待機")
 
@@ -543,6 +540,23 @@ class App(tk.Tk):
         self.title("笑ってはいけないチャレンジ")
         self.geometry("800x700")
 
+        # --- 設定値 (Tkinter変数) ---
+        self.smile_threshold = tk.DoubleVar(value=0.70)
+        self.frame_resize_scale = tk.DoubleVar(value=0.5)
+        self.game_over_duration = tk.DoubleVar(value=5.0)
+        self.win_duration = tk.DoubleVar(value=5.0)
+        self.camera_search_range = tk.IntVar(value=10)
+        self.webcam_update_interval = tk.IntVar(value=15)
+        self.video_process_timeout = tk.DoubleVar(value=2.0)
+        
+        # video_player_process に渡す設定
+        self.frame_skip_threshold = tk.IntVar(value=100)
+        self.sync_tolerance_frames = tk.IntVar(value=2)
+        self.max_frame_wait_ms = tk.IntVar(value=50)
+        
+        # 設定ウィンドウ管理
+        self.settings_window = None
+
         # 状態管理
         self.game_state = GameState.IDLE
         self.state_change_time = None
@@ -621,6 +635,11 @@ class App(tk.Tk):
         self.start_button = tk.Button(
             self.control_frame, text="ゲーム開始", command=self.start_game, state="disabled")
         self.start_button.pack(side="left", padx=5)
+
+        self.settings_button = tk.Button(
+            self.control_frame, text="設定", command=self.open_settings_window)
+        self.settings_button.pack(side="left", padx=5)
+        
         self.status_label = tk.Label(
             self.control_frame, text="ようこそ！動画とWebカメラを選択してください。")
         self.status_label.pack(side="left", padx=5)
@@ -666,7 +685,7 @@ class App(tk.Tk):
             self.cap_webcam = None
 
         self.camera_list = []
-        for i in range(CAMERA_SEARCH_RANGE):
+        for i in range(self.camera_search_range.get()):
             try:
                 cap = cv2.VideoCapture(i)
                 if cap.isOpened():
@@ -802,6 +821,26 @@ class App(tk.Tk):
         )
         self.video_process.start()
         self.status_label.config(text="動画を準備中...")
+        
+        # video_player_process に渡す設定を取得
+        process_settings = {
+            "frame_skip_threshold": self.frame_skip_threshold.get(),
+            "sync_tolerance_frames": self.sync_tolerance_frames.get(),
+            "max_frame_wait_ms": self.max_frame_wait_ms.get()
+        }
+        
+        logger.info(f"ゲームを開始しました (表示モード: {'フルスクリーン' if fullscreen else 'ウィンドウ'})")
+        logger.info(f"プロセス設定: {process_settings}")
+
+        self.game_over_event = multiprocessing.Event()
+        self.video_ready_event = multiprocessing.Event()
+        self.video_process = multiprocessing.Process(
+            target=video_player_process,
+            args=(self.video_path, self.game_over_event, self.video_ready_event, fullscreen),
+            kwargs=process_settings # kwargsとして渡す
+        )
+        self.video_process.start()
+        self.status_label.config(text="動画を準備中...")
         logger.info(f"ゲームを開始しました (表示モード: {'フルスクリーン' if fullscreen else 'ウィンドウ'})")
         
         # 動画準備完了を監視
@@ -831,20 +870,21 @@ class App(tk.Tk):
                 # 動画が実際に再生中で、かつPLAYING状態の場合のみ表情判定を行う
                 if self.game_state == GameState.PLAYING and self.video_ready_received:
                     try:
+                        resize_scale = self.frame_resize_scale.get()
                         small_frame = cv2.resize(
                             frame, (0, 0),
-                            fx=FRAME_RESIZE_SCALE,
-                            fy=FRAME_RESIZE_SCALE
+                            fx=resize_scale,
+                            fy=resize_scale
                         )
                         results = self.detector.detect_emotions(small_frame)
 
-                        scale_factor = 1.0 / FRAME_RESIZE_SCALE
+                        scale_factor = 1.0 / resize_scale
                         for result in results:
                             x, y, w, h = [int(v * scale_factor) for v in result['box']]
                             emotions = result['emotions']
                             smile_score = emotions.get('happy', 0)
 
-                            if smile_score > SMILE_THRESHOLD:
+                            if smile_score > self.smile_threshold.get():
                                 label = f"笑顔！ ({smile_score:.2f})"
                                 color = (0, 255, 0)
                                 self.game_state = GameState.GAME_OVER
@@ -866,7 +906,7 @@ class App(tk.Tk):
                         logger.error(f"感情検出エラー: {e}")
                 elif self.game_state == GameState.PREPARING:
                     # 準備中はメッセージを表示
-                    cv2.putText(frame, "Preparing...", (50, 50),
+                            cv2.putText(frame, "Preparing...", (50, 50),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
 
             # --- 状態遷移チェック ---
@@ -880,7 +920,7 @@ class App(tk.Tk):
                             cv2.FONT_HERSHEY_TRIPLEX, 5, (0, 0, 255), 10)
                 self.status_label.config(text="笑いましたね！ゲームオーバーです。")
                 
-                if self.state_change_time and (time.time() - self.state_change_time > GAME_OVER_DISPLAY_DURATION):
+                if self.state_change_time and (time.time() - self.state_change_time > self.game_over_duration.get()):
                     self.reset_game_state()
             
             # ABORTED状態の場合は何も表示せずにリセット待ち
@@ -905,7 +945,7 @@ class App(tk.Tk):
                             cv2.FONT_HERSHEY_TRIPLEX, 3, (0, 255, 0), 5)
                 self.status_label.config(text="おめでとうございます！あなたの勝ちです！")
                 
-                if self.win_start_time and (time.time() - self.win_start_time > WIN_DISPLAY_DURATION):
+                if self.win_start_time and (time.time() - self.win_start_time > self.win_duration.get()):
                     self.reset_game_state()
 
             # --- フレーム表示 ---
@@ -924,7 +964,7 @@ class App(tk.Tk):
         except Exception as e:
             logger.error(f"Webカメラフィード更新エラー: {e}")
 
-        self._feed_update_id = self.after(WEBCAM_UPDATE_INTERVAL_MS, self.update_webcam_feed)
+        self._feed_update_id = self.after(self.webcam_update_interval.get(), self.update_webcam_feed)
 
     def reset_game_state(self):
         """ゲーム状態をリセット"""
@@ -942,7 +982,7 @@ class App(tk.Tk):
             if self.video_process.is_alive():
                 logger.info("動画プロセスを終了します")
                 self.video_process.terminate()
-                self.video_process.join(timeout=VIDEO_PROCESS_TIMEOUT)
+                self.video_process.join(timeout=self.video_process_timeout.get())
                 if self.video_process.is_alive():
                     logger.warning("動画プロセスが応答しません。強制終了します")
                     self.video_process.kill()
@@ -976,6 +1016,9 @@ class App(tk.Tk):
         if messagebox.askokcancel("終了", "終了しますか？"):
             logger.info("アプリケーションを終了します")
             
+            # 設定ウィンドウが開いていれば閉じる
+            self.on_close_settings_window()
+
             # フィード更新を停止
             if self._feed_update_id:
                 self.after_cancel(self._feed_update_id)
@@ -991,7 +1034,7 @@ class App(tk.Tk):
                 if self.video_process.is_alive():
                     logger.info("動画プロセスを終了しています...")
                     self.video_process.terminate()
-                    self.video_process.join(timeout=VIDEO_PROCESS_TIMEOUT)
+                    self.video_process.join(timeout=self.video_process_timeout.get())
                     
                     if self.video_process.is_alive():
                         logger.warning("動画プロセスが応答しません。強制終了します")
@@ -1009,6 +1052,64 @@ class App(tk.Tk):
             self.destroy()
             logger.info("アプリケーションが正常に終了しました")
 
+    def open_settings_window(self):
+        """設定ウィンドウを開く"""
+        if self.settings_window and self.settings_window.winfo_exists():
+            self.settings_window.lift()
+            return
+
+        self.settings_window = tk.Toplevel(self)
+        self.settings_window.title("設定")
+        self.settings_window.geometry("400x600")
+        
+        # ウィンドウを閉じたときの処理
+        self.settings_window.protocol("WM_DELETE_WINDOW", self.on_close_settings_window)
+
+        main_frame = tk.Frame(self.settings_window)
+        main_frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        tk.Label(main_frame, text="ゲーム設定", font=("", 14, "bold")).pack(pady=5)
+
+        # スライダーの作成 (tk.Scale)
+        tk.Scale(main_frame, from_=0.1, to=1.0, resolution=0.01, 
+                 orient="horizontal", label="笑顔のしきい値 (SMILE_THRESHOLD)", 
+                 variable=self.smile_threshold, length=350).pack(fill="x", pady=5)
+                 
+        tk.Scale(main_frame, from_=0.1, to=1.0, resolution=0.1, 
+                 orient="horizontal", label="カメラリサイズ倍率 (FRAME_RESIZE_SCALE)", 
+                 variable=self.frame_resize_scale, length=350).pack(fill="x", pady=5)
+
+        tk.Scale(main_frame, from_=1.0, to=10.0, resolution=0.5, 
+                 orient="horizontal", label="ゲームオーバー表示時間(秒)", 
+                 variable=self.game_over_duration, length=350).pack(fill="x", pady=5)
+
+        tk.Scale(main_frame, from_=1.0, to=10.0, resolution=0.5, 
+                 orient="horizontal", label="勝利表示時間(秒) (WIN_DURATION)", 
+                 variable=self.win_duration, length=350).pack(fill="x", pady=5)
+
+        tk.Label(main_frame, text="詳細設定", font=("", 12, "bold")).pack(pady=(10, 5))
+
+        # エントリーの作成 (tk.Entry)
+        def create_entry_row(parent, text, variable, from_, to_):
+            frame = tk.Frame(parent)
+            frame.pack(fill="x", pady=2)
+            tk.Label(frame, text=f"{text} ({from_}～{to_}):", width=30, anchor="w").pack(side="left")
+            tk.Entry(frame, textvariable=variable, width=10).pack(side="left", padx=5)
+
+        create_entry_row(main_frame, "カメラ検索数", self.camera_search_range, 1, 20)
+        create_entry_row(main_frame, "カメラ更新間隔(ms)", self.webcam_update_interval, 10, 100)
+        create_entry_row(main_frame, "プロセス終了待機(秒)", self.video_process_timeout, 1.0, 5.0)
+        create_entry_row(main_frame, "フレームスキップ閾値", self.frame_skip_threshold, 10, 500)
+        create_entry_row(main_frame, "同期許容フレーム", self.sync_tolerance_frames, 1, 10)
+        create_entry_row(main_frame, "最大フレーム待機(ms)", self.max_frame_wait_ms, 10, 200)
+
+        tk.Button(main_frame, text="閉じる", command=self.on_close_settings_window).pack(pady=10)
+
+    def on_close_settings_window(self):
+        """設定ウィンドウを閉じる"""
+        if self.settings_window:
+            self.settings_window.destroy()
+            self.settings_window = None
 
 def run():
     """アプリケーションのエントリーポイント"""
