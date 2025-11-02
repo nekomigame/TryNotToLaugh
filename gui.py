@@ -9,6 +9,7 @@ from enum import Enum
 import uuid
 import hashlib
 from contextlib import contextmanager
+import threading # 問題点4 (GUIフリーズ対策) のためにインポート
 
 # ロギング設定
 logging.basicConfig(
@@ -193,6 +194,8 @@ def video_player_process(video_path, game_over_event, video_ready_event, fullscr
     import cv2
     import traceback
     from moviepy.editor import VideoFileClip
+    import tempfile # 問題点3 (非ASCIIパス) のためにインポート
+    import shutil # 問題点3 (非ASCIIパス) のためにインポート
     
     # Pygame初期化
     pygame.init()
@@ -203,15 +206,37 @@ def video_player_process(video_path, game_over_event, video_ready_event, fullscr
     audio_file = None  # 使用する音声ファイル
     total_duration = None # 動画の長さを初期化
     has_audio = False # 音声の有無を初期化
+    temp_video_file = None # 問題点3 (非ASCIIパス) 用
 
     try:
+        # --- 問題点3: 非ASCIIパス対応 ---
+        try:
+            video_path.encode('ascii')
+            logger.debug("動画パスはASCIIです。")
+            video_path_to_use = video_path
+        except UnicodeEncodeError:
+            logger.info("非ASCII動画パスを検出しました。一時ファイルにコピーします。")
+            try:
+                # 拡張子を保持した一時ファイルを作成
+                ext = os.path.splitext(video_path)[1]
+                fd, temp_video_file = tempfile.mkstemp(suffix=ext, dir=TEMP_DIR)
+                os.close(fd) # ファイルディスクリプタを閉じる
+                
+                shutil.copy(video_path, temp_video_file)
+                video_path_to_use = temp_video_file
+                logger.info(f"一時ファイルにコピー完了: {temp_video_file}")
+            except Exception as e:
+                logger.warning(f"一時ファイルへの動画コピーに失敗: {e}。元のパスを試行します。")
+                video_path_to_use = video_path
+        
         print("[動画処理] 動画ファイルをチェック中...")
-        if not os.path.exists(video_path):
-            logger.error(f"動画ファイルが見つかりません: {video_path}")
+        if not os.path.exists(video_path_to_use):
+            logger.error(f"動画ファイルが見つかりません: {video_path_to_use}")
             game_over_event.set()
             return
 
         # --- 音声キャッシュのチェック ---
+        # (キャッシュキーは元のパス `video_path` を使用)
         print("[動画処理] 音声キャッシュをチェック中...")
         cached_audio_path = get_cached_audio_path(video_path)
         use_cached_audio = False
@@ -232,7 +257,7 @@ def video_player_process(video_path, game_over_event, video_ready_event, fullscr
         # --- 動画情報の取得と音声抽出 ---
         print("[動画処理] 動画情報を取得中...")
         try:
-            with VideoFileClip(video_path) as clip:
+            with VideoFileClip(video_path_to_use) as clip:
                 # 動画の基本情報を取得
                 video_fps = clip.fps if clip.fps else 30
                 video_size = clip.size if clip.size else (640, 480)
@@ -276,9 +301,9 @@ def video_player_process(video_path, game_over_event, video_ready_event, fullscr
 
         # --- OpenCVでのビデオキャプチャ準備 ---
         print("[動画処理] 動画ファイルを開いています...")
-        cap = cv2.VideoCapture(video_path)
+        cap = cv2.VideoCapture(video_path_to_use)
         if not cap.isOpened():
-            logger.error(f"OpenCVで動画ファイルを開けませんでした: {video_path}")
+            logger.error(f"OpenCVで動画ファイルを開けませんでした: {video_path_to_use}")
             print("[動画処理] エラー: 動画ファイルを開けませんでした")
             game_over_event.set()
             return
@@ -526,6 +551,14 @@ def video_player_process(video_path, game_over_event, video_ready_event, fullscr
                 except Exception as e:
                     logger.warning(f"一時音声ファイルの削除に失敗: {e}")
         
+        # --- 問題点3: 一時動画ファイルの削除 ---
+        if temp_video_file and os.path.exists(temp_video_file):
+            try:
+                os.remove(temp_video_file)
+                logger.info(f"一時動画ファイルを削除: {temp_video_file}")
+            except Exception as e:
+                logger.warning(f"一時動画ファイルの削除に失敗: {e}")
+
         logger.info("動画再生プロセスが終了しました")
 
 
@@ -551,13 +584,18 @@ class App(tk.Tk):
         
         # 設定ウィンドウ管理
         self.settings_window = None
+        
+        # バリデーションコマンドの登録 (問題点1)
+        self.vcmd_int = (self.register(self._validate_int), '%P')
+        self.vcmd_float = (self.register(self._validate_float), '%P')
 
         # 状態管理
         self.game_state = GameState.IDLE
         self.state_change_time = None
         self.win_start_time = None  # 初期化を追加
         self.video_ready_received = False  # 動画準備完了フラグ
-        
+        self.detector_ready = False # 問題点4 (GUIフリーズ対策)
+
         # リソース管理
         self.video_path = None
         self.game_over_event = None
@@ -644,31 +682,84 @@ class App(tk.Tk):
         # ESCキーでゲーム終了
         self.bind("<Escape>", self.on_escape_key)
 
-        self.init_face_detector()
+        self.init_face_detector() # 別スレッドで初期化を開始
         self.selected_camera.trace_add("write", self.on_camera_select)
         self.find_and_update_cameras()
 
-    def init_face_detector(self):
-        """顔検出器の初期化"""
+    def _validate_int(self, value_if_allowed):
+        """問題点1: 整数入力のバリデーション"""
+        if value_if_allowed == "":
+            return True  # 空の入力を許可
         try:
-            self.status_label.config(text="顔検出器を初期化しています (mtcnn)...")
-            self.update()
+            val = int(value_if_allowed)
+            return val >= 0 # 0以上のみ許可 (例として)
+        except ValueError:
+            return False
+
+    def _validate_float(self, value_if_allowed):
+        """問題点1: 浮動小数点数入力のバリデーション"""
+        if value_if_allowed == "":
+            return True  # 空の入力を許可
+        try:
+            float(value_if_allowed)
+            return True
+        except ValueError:
+            return False
+
+    def init_face_detector(self):
+        """問題点4: 顔検出器の初期化 (別スレッドで実行)"""
+        self.status_label.config(text="顔検出器を初期化しています...")
+        self.detector_ready = False
+        self.check_start_button_state() # スタートボタンを無効化
+
+        # スレッドを作成して実行
+        thread = threading.Thread(target=self._load_detector_thread)
+        thread.daemon = True # メインスレッド終了時にスレッドも終了
+        thread.start()
+
+    def _load_detector_thread(self):
+        """問題点4: 顔検出器をロードするワーカースレッド"""
+        try:
+            logger.info("顔検出器 (mtcnn) の初期化を開始...")
             from fer.fer import FER
-            self.detector = FER(mtcnn=True)
+            detector = FER(mtcnn=True)
             logger.info("FER検出器をMTCNNで初期化しました")
+            
+            # 完了をメインスレッドに通知
+            self.after(0, self._on_detector_ready, detector)
+            
         except Exception as e:
             logger.warning(f"MTCNNの初期化に失敗: {e}")
             try:
-                self.status_label.config(text="mtcnnなしで再試行しています...")
-                self.update()
+                logger.info("mtcnnなしで再試行しています...")
+                # メインスレッドに通知
+                self.after(0, lambda: self.status_label.config(text="mtcnnなしで再試行しています..."))
+                
                 from fer.fer import FER
-                self.detector = FER(mtcnn=False)
+                detector = FER(mtcnn=False)
                 logger.info("FER検出器をMTCNNなしで初期化しました")
+                
+                # 完了をメインスレッドに通知
+                self.after(0, self._on_detector_ready, detector)
+                
             except Exception as e2:
                 logger.error(f"顔検出器の初期化に完全に失敗: {e2}")
-                messagebox.showerror("エラー", f"顔検出器の初期化に失敗しました: {e2}")
-                return
+                # エラーをメインスレッドに通知
+                self.after(0, self._on_detector_failed, e2)
+
+    def _on_detector_ready(self, detector):
+        """問題点4: 顔検出器の準備が完了した (メインスレッドで実行)"""
+        self.detector = detector
+        self.detector_ready = True
         self.status_label.config(text="顔検出器の準備ができました。")
+        self.check_start_button_state() # スタートボタンの状態を更新
+
+    def _on_detector_failed(self, error):
+        """問題点4: 顔検出器の準備が失敗した (メインスレッドで実行)"""
+        self.detector_ready = False
+        messagebox.showerror("エラー", f"顔検出器の初期化に失敗しました: {error}")
+        self.status_label.config(text="エラー: 顔検出器の初期化に失敗。")
+        self.check_start_button_state()
 
     def find_and_update_cameras(self):
         """利用可能なカメラを検索"""
@@ -733,7 +824,8 @@ class App(tk.Tk):
 
         try:
             import cv2
-            self.cap_webcam = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+            # --- 問題点5: CAP_DSHOW を削除 ---
+            self.cap_webcam = cv2.VideoCapture(camera_index)
 
             if self.cap_webcam.isOpened():
                 self.status_label.config(text=f"Webカメラ {camera_index} を使用中。")
@@ -753,7 +845,8 @@ class App(tk.Tk):
 
     def check_start_button_state(self):
         """スタートボタンの有効/無効を制御"""
-        if self.video_path and self.cap_webcam and self.cap_webcam.isOpened():
+        # 問題点4: detector_ready も条件に追加
+        if self.video_path and self.cap_webcam and self.cap_webcam.isOpened() and self.detector_ready:
             self.start_button.config(state="normal")
         else:
             self.start_button.config(state="disabled")
@@ -791,6 +884,11 @@ class App(tk.Tk):
             return
         if not self.cap_webcam or not self.cap_webcam.isOpened():
             messagebox.showwarning("警告", "使用可能なWebカメラが選択されていません。")
+            return
+        
+        # 問題点4: 検出器の準備ができていない場合は開始しない
+        if not self.detector_ready:
+            messagebox.showwarning("警告", "顔検出器がまだ準備中です。")
             return
 
         self.start_button.config(state="disabled")
@@ -863,7 +961,8 @@ class App(tk.Tk):
                 return
 
             # --- ゲームロジック ---
-            if self.video_process and self.video_process.is_alive():
+            # 問題点4: self.detector が None でないことも確認
+            if self.detector and self.video_process and self.video_process.is_alive():
                 # 動画が実際に再生中で、かつPLAYING状態の場合のみ表情判定を行う
                 if self.game_state == GameState.PLAYING and self.video_ready_received:
                     try:
@@ -966,6 +1065,11 @@ class App(tk.Tk):
     def reset_game_state(self):
         """ゲーム状態をリセット"""
         logger.info("ゲーム状態をリセットします")
+
+        # --- 問題点2: プロセスに終了イベントを送信 ---
+        if self.game_over_event:
+            self.game_over_event.set()
+        
         self.status_label.config(
             text="ゲーム終了。もう一度プレイするには動画を選択してください。")
         self.start_button.config(state="normal")
@@ -1022,7 +1126,7 @@ class App(tk.Tk):
                 self._feed_update_id = None
             self._is_updating_feed = False
             
-            # ゲームオーバーイベントを設定
+            # ゲームオーバーイベントを設定 (問題点2 と同様)
             if self.game_over_event:
                 self.game_over_event.set()
             
@@ -1087,18 +1191,23 @@ class App(tk.Tk):
         tk.Label(main_frame, text="詳細設定", font=("", 12, "bold")).pack(pady=(10, 5))
 
         # エントリーの作成 (tk.Entry)
-        def create_entry_row(parent, text, variable, from_, to_):
+        def create_entry_row(parent, text, variable, from_, to_, validation_cmd):
             frame = tk.Frame(parent)
             frame.pack(fill="x", pady=2)
             tk.Label(frame, text=f"{text} ({from_}～{to_}):", width=30, anchor="w").pack(side="left")
-            tk.Entry(frame, textvariable=variable, width=10).pack(side="left", padx=5)
+            
+            # 問題点1: バリデーションコマンドを追加
+            entry = tk.Entry(frame, textvariable=variable, width=10, 
+                             validate="key", validatecommand=validation_cmd)
+            entry.pack(side="left", padx=5)
 
-        create_entry_row(main_frame, "カメラ検索数", self.camera_search_range, 1, 20)
-        create_entry_row(main_frame, "カメラ更新間隔(ms)", self.webcam_update_interval, 10, 100)
-        create_entry_row(main_frame, "プロセス終了待機(秒)", self.video_process_timeout, 1.0, 5.0)
-        create_entry_row(main_frame, "フレームスキップ閾値", self.frame_skip_threshold, 10, 500)
-        create_entry_row(main_frame, "同期許容フレーム", self.sync_tolerance_frames, 1, 10)
-        create_entry_row(main_frame, "最大フレーム待機(ms)", self.max_frame_wait_ms, 10, 200)
+        # 問題点1: バリデーションコマンドを渡す
+        create_entry_row(main_frame, "カメラ検索数", self.camera_search_range, 1, 20, self.vcmd_int)
+        create_entry_row(main_frame, "カメラ更新間隔(ms)", self.webcam_update_interval, 10, 100, self.vcmd_int)
+        create_entry_row(main_frame, "プロセス終了待機(秒)", self.video_process_timeout, 1.0, 5.0, self.vcmd_float)
+        create_entry_row(main_frame, "フレームスキップ閾値", self.frame_skip_threshold, 10, 500, self.vcmd_int)
+        create_entry_row(main_frame, "同期許容フレーム", self.sync_tolerance_frames, 1, 10, self.vcmd_int)
+        create_entry_row(main_frame, "最大フレーム待機(ms)", self.max_frame_wait_ms, 10, 200, self.vcmd_int)
 
         tk.Button(main_frame, text="閉じる", command=self.on_close_settings_window).pack(pady=10)
 
