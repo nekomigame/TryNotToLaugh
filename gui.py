@@ -274,11 +274,6 @@ def video_player_process(video_path, game_over_event, video_ready_event, fullscr
             print(f"[動画処理] 警告: Moviepyでの処理に失敗しました: {e}")
             total_duration = None # 失敗した場合はNoneに戻す
 
-        # --- ★★★ 修正箇所 ★★★ ---
-        # 以下の処理が `except` ブロックの中に入ってしまっていたため、
-        # Moviepyが成功すると実行されない問題があった。
-        # インデントを修正し、`try...except` の外（ただし外側の `try` の中）に移動。
-
         # --- OpenCVでのビデオキャプチャ準備 ---
         print("[動画処理] 動画ファイルを開いています...")
         cap = cv2.VideoCapture(video_path)
@@ -431,8 +426,8 @@ def video_player_process(video_path, game_over_event, video_ready_event, fullscr
                             break
                         current_frame_num += 1
                         skip_count += 1
-                        if skip_count > 0:
-                            logger.debug(f"{skip_count}フレームをスキップ (遅延: {frame_diff})")
+                    if skip_count > 0:
+                        logger.debug(f"{skip_count}フレームをスキップ (遅延: {frame_diff})")
             elif frame_diff < -sync_tolerance_frames:
                 # 進みすぎている場合：少し待機
                 wait_time = abs(frame_diff) * frame_duration
@@ -812,15 +807,6 @@ class App(tk.Tk):
 
         # 表示モードを取得
         fullscreen = (self.display_mode.get() == "fullscreen")
-
-        self.game_over_event = multiprocessing.Event()
-        self.video_ready_event = multiprocessing.Event()
-        self.video_process = multiprocessing.Process(
-            target=video_player_process,
-            args=(self.video_path, self.game_over_event, self.video_ready_event, fullscreen)
-        )
-        self.video_process.start()
-        self.status_label.config(text="動画を準備中...")
         
         # video_player_process に渡す設定を取得
         process_settings = {
@@ -832,6 +818,9 @@ class App(tk.Tk):
         logger.info(f"ゲームを開始しました (表示モード: {'フルスクリーン' if fullscreen else 'ウィンドウ'})")
         logger.info(f"プロセス設定: {process_settings}")
 
+        # --- ★★★ 修正箇所 ★★★ ---
+        # 重複していたプロセス起動を1つにまとめます
+        
         self.game_over_event = multiprocessing.Event()
         self.video_ready_event = multiprocessing.Event()
         self.video_process = multiprocessing.Process(
@@ -841,7 +830,15 @@ class App(tk.Tk):
         )
         self.video_process.start()
         self.status_label.config(text="動画を準備中...")
-        logger.info(f"ゲームを開始しました (表示モード: {'フルスクリーン' if fullscreen else 'ウィンドウ'})")
+        
+        # 2回目の起動処理を削除
+        # --- ここから削除 ---
+        # self.game_over_event = multiprocessing.Event()
+        # ... (重複ブロック) ...
+        # self.video_process.start()
+        # self.status_label.config(text="動画を準備中...")
+        # logger.info(f"ゲームを開始しました (表示モード: {'フルスクリーン' if fullscreen else 'ウィンドウ'})")
+        # --- ここまで削除 ---
         
         # 動画準備完了を監視
         self.check_video_ready()
@@ -906,7 +903,7 @@ class App(tk.Tk):
                         logger.error(f"感情検出エラー: {e}")
                 elif self.game_state == GameState.PREPARING:
                     # 準備中はメッセージを表示
-                            cv2.putText(frame, "Preparing...", (50, 50),
+                    cv2.putText(frame, "Preparing...", (50, 50),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
 
             # --- 状態遷移チェック ---
@@ -1060,7 +1057,7 @@ class App(tk.Tk):
 
         self.settings_window = tk.Toplevel(self)
         self.settings_window.title("設定")
-        self.settings_window.geometry("400x600")
+        self.settings_window.geometry("400x550")
         
         # ウィンドウを閉じたときの処理
         self.settings_window.protocol("WM_DELETE_WINDOW", self.on_close_settings_window)
