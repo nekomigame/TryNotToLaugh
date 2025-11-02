@@ -45,6 +45,7 @@ if not os.path.exists(TEMP_DIR):
 class GameState(Enum):
     """ゲーム状態を管理するEnum"""
     IDLE = "idle"
+    PREPARING = "preparing"  # 動画準備中
     PLAYING = "playing"
     GAME_OVER = "game_over"
     WIN = "win"
@@ -142,7 +143,7 @@ def temporary_audio_file():
                 logger.warning(f"一時ファイルの削除に失敗: {e}")
 
 
-def video_player_process(video_path, game_over_event, fullscreen=False):
+def video_player_process(video_path, game_over_event, video_ready_event, fullscreen=False):
     """
     PygameとOpenCVを使用して別のプロセスで動画を再生します。
     """
@@ -159,6 +160,7 @@ def video_player_process(video_path, game_over_event, fullscreen=False):
 
     with temporary_audio_file() as temp_audio_file:
         try:
+            print("[動画処理] 動画ファイルをチェック中...")
             if not os.path.exists(video_path):
                 logger.error(f"動画ファイルが見つかりません: {video_path}")
                 game_over_event.set()
@@ -166,24 +168,33 @@ def video_player_process(video_path, game_over_event, fullscreen=False):
 
             # --- 音声抽出 (Moviepy) ---
             has_audio = False
+            print("[動画処理] 動画情報を取得中...")
             try:
                 with VideoFileClip(video_path) as clip:
                     if clip.audio:
+                        print("[動画処理] 音声を抽出中...")
                         clip.audio.write_audiofile(
                             temp_audio_file, codec='mp3', logger=None)
                         has_audio = True
+                        print("[動画処理] 音声抽出完了")
+                    else:
+                        print("[動画処理] この動画には音声がありません")
                     video_fps = clip.fps if clip.fps else 30
                     video_size = clip.size if clip.size else (640, 480)
                     total_duration = clip.duration
                 logger.info(f"動画情報取得成功: FPS={video_fps}, サイズ={video_size}, 音声={has_audio}")
+                print(f"[動画処理] 動画情報: {video_fps}fps, {video_size[0]}x{video_size[1]}, 長さ: {total_duration:.1f}秒")
             except Exception as e:
                 logger.warning(f"Moviepyでの処理に失敗: {e}")
+                print(f"[動画処理] 警告: Moviepyでの処理に失敗しました: {e}")
                 total_duration = None
 
             # --- OpenCVでのビデオキャプチャ準備 ---
+            print("[動画処理] 動画ファイルを開いています...")
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
                 logger.error(f"OpenCVで動画ファイルを開けませんでした: {video_path}")
+                print("[動画処理] エラー: 動画ファイルを開けませんでした")
                 game_over_event.set()
                 return
 
@@ -198,7 +209,10 @@ def video_player_process(video_path, game_over_event, fullscreen=False):
                 frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
                 total_duration = frame_count / video_fps if video_fps > 0 else 0
 
+            print(f"[動画処理] 動画ファイルを開きました: {video_fps}fps, {video_size[0]}x{video_size[1]}")
+
             # --- Pygameのセットアップ ---
+            print("[動画処理] Pygameを初期化中...")
             pygame.display.set_caption("笑ってはいけないチャレンジ - 動画")
             
             if fullscreen:
@@ -239,14 +253,21 @@ def video_player_process(video_path, game_over_event, fullscreen=False):
             audio_ready = False
             if has_audio and os.path.exists(temp_audio_file) and os.path.getsize(temp_audio_file) > 0:
                 try:
+                    print("[動画処理] 音声を初期化中...")
                     pygame.mixer.init()
                     pygame.mixer.music.load(temp_audio_file)
                     pygame.mixer.music.play()
                     audio_ready = True
+                    print("[動画処理] 音声再生を開始しました")
                     logger.info("音声再生を開始しました")
                 except Exception as e:
                     logger.warning(f"音声の初期化に失敗: {e}")
+                    print(f"[動画処理] 警告: 音声の初期化に失敗しました: {e}")
 
+            # 動画準備完了を通知
+            print("[動画処理] ===== 準備完了！再生を開始します =====")
+            video_ready_event.set()
+            
             # --- 再生ループ ---
             running = True
             playback_start_time = time.time()
@@ -424,10 +445,12 @@ class App(tk.Tk):
         self.game_state = GameState.IDLE
         self.state_change_time = None
         self.win_start_time = None  # 初期化を追加
+        self.video_ready_received = False  # 動画準備完了フラグ
         
         # リソース管理
         self.video_path = None
         self.game_over_event = None
+        self.video_ready_event = None  # 動画準備完了イベント
         self.video_process = None
         self.detector = None
         self.cap_webcam = None
@@ -632,6 +655,19 @@ class App(tk.Tk):
             logger.info(f"動画を選択: {path}")
             self.check_start_button_state()
 
+    def check_video_ready(self):
+        """動画の準備完了を監視"""
+        if self.video_ready_event and self.video_ready_event.is_set():
+            if not self.video_ready_received:
+                self.video_ready_received = True
+                self.game_state = GameState.PLAYING
+                self.status_label.config(text="ゲーム進行中... 笑わないで！")
+                logger.info("動画の再生が開始されました。表情判定を開始します。")
+                print("[メイン] 動画再生開始を検出。表情判定を開始します。")
+        elif self.game_state == GameState.PREPARING and self.video_process and self.video_process.is_alive():
+            # まだ準備中の場合は100ms後に再チェック
+            self.after(100, self.check_video_ready)
+
     def start_game(self):
         """ゲームを開始"""
         if not self.video_path:
@@ -649,20 +685,25 @@ class App(tk.Tk):
         self.fullscreen_radio.config(state="disabled")
         self.status_label.config(text="ゲームを開始しています...")
 
-        self.game_state = GameState.PLAYING
+        self.game_state = GameState.PREPARING
         self.state_change_time = None
+        self.video_ready_received = False
 
         # 表示モードを取得
         fullscreen = (self.display_mode.get() == "fullscreen")
 
         self.game_over_event = multiprocessing.Event()
+        self.video_ready_event = multiprocessing.Event()
         self.video_process = multiprocessing.Process(
             target=video_player_process,
-            args=(self.video_path, self.game_over_event, fullscreen)
+            args=(self.video_path, self.game_over_event, self.video_ready_event, fullscreen)
         )
         self.video_process.start()
-        self.status_label.config(text="ゲーム進行中... 笑わないで！")
+        self.status_label.config(text="動画を準備中...")
         logger.info(f"ゲームを開始しました (表示モード: {'フルスクリーン' if fullscreen else 'ウィンドウ'})")
+        
+        # 動画準備完了を監視
+        self.check_video_ready()
 
     def update_webcam_feed(self):
         """Webカメラフィードの更新"""
@@ -685,7 +726,8 @@ class App(tk.Tk):
 
             # --- ゲームロジック ---
             if self.video_process and self.video_process.is_alive():
-                if self.game_state == GameState.PLAYING:
+                # 動画が実際に再生中で、かつPLAYING状態の場合のみ表情判定を行う
+                if self.game_state == GameState.PLAYING and self.video_ready_received:
                     try:
                         small_frame = cv2.resize(
                             frame, (0, 0),
@@ -720,6 +762,10 @@ class App(tk.Tk):
                                 break
                     except Exception as e:
                         logger.error(f"感情検出エラー: {e}")
+                elif self.game_state == GameState.PREPARING:
+                    # 準備中はメッセージを表示
+                    cv2.putText(frame, "Preparing...", (50, 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
 
             # --- 状態遷移チェック ---
             if self.game_state == GameState.GAME_OVER:
@@ -807,7 +853,7 @@ class App(tk.Tk):
 
     def on_escape_key(self, event=None):
         """ESCキーが押された時の処理"""
-        if self.game_state in [GameState.PLAYING, GameState.GAME_OVER, GameState.WIN]:
+        if self.game_state in [GameState.PREPARING, GameState.PLAYING, GameState.GAME_OVER, GameState.WIN]:
             logger.info("ESCキーでゲームを中断します")
             
             # 状態をABORTEDに設定

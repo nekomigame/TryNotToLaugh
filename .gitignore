@@ -7,3 +7,5 @@
 /gui.build
 /dist
 *.spec
+*.mp4
+*.mp3
