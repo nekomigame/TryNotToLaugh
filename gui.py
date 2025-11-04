@@ -9,7 +9,8 @@ from enum import Enum
 import uuid
 import hashlib
 from contextlib import contextmanager
-import threading # 問題点4 (GUIフリーズ対策) のためにインポート
+import threading
+import shutil
 
 # ロギング設定
 logging.basicConfig(
@@ -194,8 +195,8 @@ def video_player_process(video_path, game_over_event, video_ready_event, fullscr
     import cv2
     import traceback
     from moviepy.editor import VideoFileClip
-    import tempfile # 問題点3 (非ASCIIパス) のためにインポート
-    import shutil # 問題点3 (非ASCIIパス) のためにインポート
+    import tempfile 
+    import shutil 
     
     # Pygame初期化
     pygame.init()
@@ -206,10 +207,10 @@ def video_player_process(video_path, game_over_event, video_ready_event, fullscr
     audio_file = None  # 使用する音声ファイル
     total_duration = None # 動画の長さを初期化
     has_audio = False # 音声の有無を初期化
-    temp_video_file = None # 問題点3 (非ASCIIパス) 用
+    temp_video_file = None # 非ASCIIパス用
 
     try:
-        # --- 問題点3: 非ASCIIパス対応 ---
+        # --- 非ASCIIパス対応 ---
         try:
             video_path.encode('ascii')
             logger.debug("動画パスはASCIIです。")
@@ -551,7 +552,7 @@ def video_player_process(video_path, game_over_event, video_ready_event, fullscr
                 except Exception as e:
                     logger.warning(f"一時音声ファイルの削除に失敗: {e}")
         
-        # --- 問題点3: 一時動画ファイルの削除 ---
+        # --- 一時動画ファイルの削除 ---
         if temp_video_file and os.path.exists(temp_video_file):
             try:
                 os.remove(temp_video_file)
@@ -687,7 +688,7 @@ class App(tk.Tk):
         self.find_and_update_cameras()
 
     def _validate_int(self, value_if_allowed):
-        """問題点1: 整数入力のバリデーション"""
+        """整数入力のバリデーション"""
         if value_if_allowed == "":
             return True  # 空の入力を許可
         try:
@@ -697,7 +698,7 @@ class App(tk.Tk):
             return False
 
     def _validate_float(self, value_if_allowed):
-        """問題点1: 浮動小数点数入力のバリデーション"""
+        """浮動小数点数入力のバリデーション"""
         if value_if_allowed == "":
             return True  # 空の入力を許可
         try:
@@ -707,7 +708,7 @@ class App(tk.Tk):
             return False
 
     def init_face_detector(self):
-        """問題点4: 顔検出器の初期化 (別スレッドで実行)"""
+        """顔検出器の初期化 (別スレッドで実行)"""
         self.status_label.config(text="顔検出器を初期化しています...")
         self.detector_ready = False
         self.check_start_button_state() # スタートボタンを無効化
@@ -718,7 +719,7 @@ class App(tk.Tk):
         thread.start()
 
     def _load_detector_thread(self):
-        """問題点4: 顔検出器をロードするワーカースレッド"""
+        """顔検出器をロードするワーカースレッド"""
         try:
             logger.info("顔検出器 (mtcnn) の初期化を開始...")
             from fer.fer import FER
@@ -748,14 +749,14 @@ class App(tk.Tk):
                 self.after(0, self._on_detector_failed, e2)
 
     def _on_detector_ready(self, detector):
-        """問題点4: 顔検出器の準備が完了した (メインスレッドで実行)"""
+        """顔検出器の準備が完了した (メインスレッドで実行)"""
         self.detector = detector
         self.detector_ready = True
         self.status_label.config(text="顔検出器の準備ができました。")
         self.check_start_button_state() # スタートボタンの状態を更新
 
     def _on_detector_failed(self, error):
-        """問題点4: 顔検出器の準備が失敗した (メインスレッドで実行)"""
+        """顔検出器の準備が失敗した (メインスレッドで実行)"""
         self.detector_ready = False
         messagebox.showerror("エラー", f"顔検出器の初期化に失敗しました: {error}")
         self.status_label.config(text="エラー: 顔検出器の初期化に失敗。")
@@ -886,7 +887,7 @@ class App(tk.Tk):
             messagebox.showwarning("警告", "使用可能なWebカメラが選択されていません。")
             return
         
-        # 問題点4: 検出器の準備ができていない場合は開始しない
+        # 検出器の準備ができていない場合は開始しない
         if not self.detector_ready:
             messagebox.showwarning("警告", "顔検出器がまだ準備中です。")
             return
@@ -915,9 +916,6 @@ class App(tk.Tk):
         
         logger.info(f"ゲームを開始しました (表示モード: {'フルスクリーン' if fullscreen else 'ウィンドウ'})")
         logger.info(f"プロセス設定: {process_settings}")
-
-        # --- ★★★ 修正箇所 ★★★ ---
-        # 重複していたプロセス起動を1つにまとめます
         
         self.game_over_event = multiprocessing.Event()
         self.video_ready_event = multiprocessing.Event()
@@ -928,15 +926,6 @@ class App(tk.Tk):
         )
         self.video_process.start()
         self.status_label.config(text="動画を準備中...")
-        
-        # 2回目の起動処理を削除
-        # --- ここから削除 ---
-        # self.game_over_event = multiprocessing.Event()
-        # ... (重複ブロック) ...
-        # self.video_process.start()
-        # self.status_label.config(text="動画を準備中...")
-        # logger.info(f"ゲームを開始しました (表示モード: {'フルスクリーン' if fullscreen else 'ウィンドウ'})")
-        # --- ここまで削除 ---
         
         # 動画準備完了を監視
         self.check_video_ready()
@@ -961,7 +950,7 @@ class App(tk.Tk):
                 return
 
             # --- ゲームロジック ---
-            # 問題点4: self.detector が None でないことも確認
+            # self.detector が None でないことも確認
             if self.detector and self.video_process and self.video_process.is_alive():
                 # 動画が実際に再生中で、かつPLAYING状態の場合のみ表情判定を行う
                 if self.game_state == GameState.PLAYING and self.video_ready_received:
@@ -1066,7 +1055,7 @@ class App(tk.Tk):
         """ゲーム状態をリセット"""
         logger.info("ゲーム状態をリセットします")
 
-        # --- 問題点2: プロセスに終了イベントを送信 ---
+        # --- プロセスに終了イベントを送信 ---
         if self.game_over_event:
             self.game_over_event.set()
         
@@ -1126,7 +1115,7 @@ class App(tk.Tk):
                 self._feed_update_id = None
             self._is_updating_feed = False
             
-            # ゲームオーバーイベントを設定 (問題点2 と同様)
+            # ゲームオーバーイベントを設定
             if self.game_over_event:
                 self.game_over_event.set()
             
@@ -1196,12 +1185,12 @@ class App(tk.Tk):
             frame.pack(fill="x", pady=2)
             tk.Label(frame, text=f"{text} ({from_}～{to_}):", width=30, anchor="w").pack(side="left")
             
-            # 問題点1: バリデーションコマンドを追加
+            # バリデーションコマンドを追加
             entry = tk.Entry(frame, textvariable=variable, width=10, 
                              validate="key", validatecommand=validation_cmd)
             entry.pack(side="left", padx=5)
 
-        # 問題点1: バリデーションコマンドを渡す
+        # バリデーションコマンドを渡す
         create_entry_row(main_frame, "カメラ検索数", self.camera_search_range, 1, 20, self.vcmd_int)
         create_entry_row(main_frame, "カメラ更新間隔(ms)", self.webcam_update_interval, 10, 100, self.vcmd_int)
         create_entry_row(main_frame, "プロセス終了待機(秒)", self.video_process_timeout, 1.0, 5.0, self.vcmd_float)
@@ -1228,6 +1217,59 @@ def run():
         logger.critical(f"致命的なエラーが発生しました: {e}", exc_info=True)
         raise
 
+def check_and_install_ffmpeg():
+    """
+    FFmpegの存在をチェックし、なければインストールする。
+    優先順位:
+    1. カレントディレクトリ (ffmpeg.exe)
+    2. 環境変数 PATH
+    3. 上記で見つからなければダウンロード
+    """
+    # 1. カレントディレクトリに ffmpeg.exe があるかチェック (Windowsを想定)
+    ffmpeg_exe_path = os.path.join(".", "ffmpeg.exe")
+    if os.path.exists(ffmpeg_exe_path):
+        logger.info(f"カレントディレクトリで ffmpeg.exe を見つけました: {os.path.abspath(ffmpeg_exe_path)}")
+        return True
+
+    # 2. 環境変数 PATH 内に ffmpeg が存在するかチェック
+    found_path = shutil.which('ffmpeg')
+    if found_path:
+        logger.info(f"環境変数 PATH 内で FFmpeg を見つけました: {found_path}")
+        return True
+
+    # 3. どこにも見つからない場合はダウンロードを試みる
+    logger.warning("FFmpeg が見つかりません。ダウンロードを開始します...")
+    
+    try:
+        # install_ffmpeg.py をインポートして実行
+        import install_ffmpeg
+        install_ffmpeg.download_and_extract()
+        
+        # ダウンロード後にもう一度カレントディレクトリをチェック
+        if os.path.exists(ffmpeg_exe_path):
+            logger.info("FFmpegのインストールが完了しました。")
+            return True
+        else:
+            logger.error("FFmpegのダウンロードまたは展開に失敗しました。")
+            return False
+            
+    except ImportError:
+        logger.error("install_ffmpeg.py が見つかりません。自動インストールはスキップされます。")
+        return False
+    except Exception as e:
+        logger.error(f"FFmpegのインストール中にエラーが発生しました: {e}")
+        return False
 
 if __name__ == '__main__':
-    run()
+    # アプリケーションを実行する前にFFmpegの準備ができているか確認
+    if check_and_install_ffmpeg():
+        # FFmpegが準備できた場合のみアプリを起動
+        run()
+    else:
+        # 失敗した場合はユーザーに通知して終了
+        print("\n--- エラー ---", file=sys.stderr)
+        print("FFmpegの準備に失敗したため、アプリケーションを起動できません。", file=sys.stderr)
+        print("手動でFFmpegをインストールし、環境変数PATHを通すか、", file=sys.stderr)
+        print("もしくは、ffmpeg.exe をこのプログラムと同じフォルダに配置してください。", file=sys.stderr)
+        # コンソールが一瞬で閉じないように待機
+        input("何かキーを押して終了します...")
