@@ -184,7 +184,7 @@ def is_cache_valid(video_path, cache_path):
         return False
 
 
-def video_player_process(video_path, game_over_event, video_ready_event, fullscreen=False,
+def video_player_process(video_path, game_over_event, video_ready_event, win_event, fullscreen=False,
                          frame_skip_threshold=100, 
                          sync_tolerance_frames=2, 
                          max_frame_wait_ms=50):
@@ -534,6 +534,11 @@ def video_player_process(video_path, game_over_event, video_ready_event, fullscr
 
         logger.info("動画再生ループを終了します")
 
+        # game_over_eventがセットされていなければ、正常終了とみなしwin_eventをセット
+        if not game_over_event.is_set():
+            logger.info("動画が正常に終了しました。勝利イベントをセットします。")
+            win_event.set()
+
     except Exception as e:
         logger.error(f"動画プロセスで予期せぬエラーが発生: {e}")
         logger.error(traceback.format_exc())
@@ -586,7 +591,7 @@ class App(tk.Tk):
         # 設定ウィンドウ管理
         self.settings_window = None
         
-        # バリデーションコマンドの登録 (問題点1)
+        # バリデーションコマンドの登録
         self.vcmd_int = (self.register(self._validate_int), '%P')
         self.vcmd_float = (self.register(self._validate_float), '%P')
 
@@ -595,12 +600,13 @@ class App(tk.Tk):
         self.state_change_time = None
         self.win_start_time = None  # 初期化を追加
         self.video_ready_received = False  # 動画準備完了フラグ
-        self.detector_ready = False # 問題点4 (GUIフリーズ対策)
+        self.detector_ready = False # GUIフリーズ対策
 
         # リソース管理
         self.video_path = None
         self.game_over_event = None
         self.video_ready_event = None  # 動画準備完了イベント
+        self.win_event = None          # 勝利イベント
         self.video_process = None
         self.detector = None
         self.cap_webcam = None
@@ -825,7 +831,6 @@ class App(tk.Tk):
 
         try:
             import cv2
-            # --- 問題点5: CAP_DSHOW を削除 ---
             self.cap_webcam = cv2.VideoCapture(camera_index)
 
             if self.cap_webcam.isOpened():
@@ -846,7 +851,6 @@ class App(tk.Tk):
 
     def check_start_button_state(self):
         """スタートボタンの有効/無効を制御"""
-        # 問題点4: detector_ready も条件に追加
         if self.video_path and self.cap_webcam and self.cap_webcam.isOpened() and self.detector_ready:
             self.start_button.config(state="normal")
         else:
@@ -919,9 +923,10 @@ class App(tk.Tk):
         
         self.game_over_event = multiprocessing.Event()
         self.video_ready_event = multiprocessing.Event()
+        self.win_event = multiprocessing.Event()
         self.video_process = multiprocessing.Process(
             target=video_player_process,
-            args=(self.video_path, self.game_over_event, self.video_ready_event, fullscreen),
+            args=(self.video_path, self.game_over_event, self.video_ready_event, self.win_event, fullscreen),
             kwargs=process_settings # kwargsとして渡す
         )
         self.video_process.start()
@@ -1015,10 +1020,17 @@ class App(tk.Tk):
             
             # 動画終了チェック（PLAYING状態でのみ）
             elif self.video_process and not self.video_process.is_alive() and self.game_state == GameState.PLAYING:
-                # 動画が正常に終了し、かつゲーム中の場合のみWINにする
-                self.game_state = GameState.WIN
-                self.win_start_time = time.time()
-                logger.info("ユーザーが勝利しました")
+                # プロセスは終了したが、WINかどうかを判定する
+                if self.win_event and self.win_event.is_set():
+                    # 正常終了した場合
+                    self.game_state = GameState.WIN
+                    self.win_start_time = time.time()
+                    logger.info("ユーザーが勝利しました")
+                else:
+                    # 異常終了または中断された場合
+                    logger.warning("動画プロセスが異常終了または中断されました。ゲームをリセットします。")
+                    self.status_label.config(text="動画の再生が中断されました。")
+                    self.reset_game_state()
 
             elif self.game_state == GameState.WIN:
                 win_text = "YOU WIN!"
@@ -1082,6 +1094,7 @@ class App(tk.Tk):
         self.game_state = GameState.IDLE
         self.state_change_time = None
         self.win_start_time = None
+        self.win_event = None
 
     def on_escape_key(self, event=None):
         """ESCキーが押された時の処理"""
@@ -1150,7 +1163,7 @@ class App(tk.Tk):
 
         self.settings_window = tk.Toplevel(self)
         self.settings_window.title("設定")
-        self.settings_window.geometry("400x550")
+        self.settings_window.geometry("400x600")
         
         # ウィンドウを閉じたときの処理
         self.settings_window.protocol("WM_DELETE_WINDOW", self.on_close_settings_window)
@@ -1263,7 +1276,7 @@ def check_and_install_ffmpeg():
 if __name__ == '__main__':
     # アプリケーションを実行する前にFFmpegの準備ができているか確認
     if check_and_install_ffmpeg():
-        # FFmpegが準備できた場合のみアプリを起動
+    # FFmpegが準備できた場合のみアプリを起動
         run()
     else:
         # 失敗した場合はユーザーに通知して終了
