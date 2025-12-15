@@ -11,6 +11,7 @@ import hashlib
 from contextlib import contextmanager
 import threading
 import shutil
+import queue
 
 # ロギング設定
 logging.basicConfig(
@@ -719,10 +720,39 @@ class App(tk.Tk):
         self.detector_ready = False
         self.check_start_button_state() # スタートボタンを無効化
 
+        # キューの初期化
+        self.detector_queue = queue.Queue()
+        
+        # ポーリング開始
+        self.check_detector_queue()
+
         # スレッドを作成して実行
         thread = threading.Thread(target=self._load_detector_thread)
         thread.daemon = True # メインスレッド終了時にスレッドも終了
         thread.start()
+
+    def check_detector_queue(self):
+        """検出器初期化スレッドからのメッセージを処理"""
+        try:
+            while True:
+                # ブロックせずにキューから取得
+                msg_type, data = self.detector_queue.get_nowait()
+                
+                if msg_type == "ready":
+                    self._on_detector_ready(data)
+                    return # 完了したのでポーリング終了
+                elif msg_type == "status":
+                    self.status_label.config(text=data)
+                elif msg_type == "error":
+                    self._on_detector_failed(data)
+                    return # 失敗したのでポーリング終了
+                    
+                self.detector_queue.task_done()
+        except queue.Empty:
+            pass
+            
+        # ポーリング継続
+        self.after(100, self.check_detector_queue)
 
     def _load_detector_thread(self):
         """顔検出器をロードするワーカースレッド"""
@@ -732,27 +762,27 @@ class App(tk.Tk):
             detector = FER(mtcnn=True)
             logger.info("FER検出器をMTCNNで初期化しました")
             
-            # 完了をメインスレッドに通知
-            self.after(0, self._on_detector_ready, detector)
+            # 完了をキューに送信
+            self.detector_queue.put(("ready", detector))
             
         except Exception as e:
             logger.warning(f"MTCNNの初期化に失敗: {e}")
             try:
                 logger.info("mtcnnなしで再試行しています...")
-                # メインスレッドに通知
-                self.after(0, lambda: self.status_label.config(text="mtcnnなしで再試行しています..."))
+                # ステータス更新をキューに送信
+                self.detector_queue.put(("status", "mtcnnなしで再試行しています..."))
                 
                 from fer.fer import FER
                 detector = FER(mtcnn=False)
                 logger.info("FER検出器をMTCNNなしで初期化しました")
                 
-                # 完了をメインスレッドに通知
-                self.after(0, self._on_detector_ready, detector)
+                # 完了をキューに送信
+                self.detector_queue.put(("ready", detector))
                 
             except Exception as e2:
                 logger.error(f"顔検出器の初期化に完全に失敗: {e2}")
-                # エラーをメインスレッドに通知
-                self.after(0, self._on_detector_failed, e2)
+                # エラーをキューに送信
+                self.detector_queue.put(("error", e2))
 
     def _on_detector_ready(self, detector):
         """顔検出器の準備が完了した (メインスレッドで実行)"""
