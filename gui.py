@@ -8,11 +8,6 @@ import queue
 import threading
 import cv2
 
-# 抽出したモジュールのインポート
-from constants import GameState
-from utils import logger, check_and_install_ffmpeg
-from video_player import video_player_process
-
 # OpenCVのログレベルを設定して、不要な警告を抑制
 os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -20,7 +15,10 @@ warnings.filterwarnings('ignore',
                         message=r'.*tf\.lite\.Interpreter is deprecated.*',
                         category=UserWarning)
 
-
+# 抽出したモジュールのインポート
+from constants import GameState
+from utils import logger, check_and_install_ffmpeg
+from video_player import video_player_process
 
 class App(tk.Tk):
     def __init__(self):
@@ -55,6 +53,15 @@ class App(tk.Tk):
         self.win_start_time = None  # 初期化を追加
         self.video_ready_received = False  # 動画準備完了フラグ
         self.detector_ready = False # GUIフリーズ対策
+        self.detector = None
+
+        # 表情認識用スレッド関連
+        self.frame_queue = queue.Queue(maxsize=1)
+        self.emotion_queue = queue.Queue(maxsize=1)
+        self.emotion_thread_active = True
+        self.emotion_thread = threading.Thread(target=self._emotion_worker, daemon=True)
+        self.emotion_thread.start()
+        self.latest_emotions = [] # 最新の認識結果を保持
 
         # リソース管理
         self.video_path = None
@@ -62,7 +69,6 @@ class App(tk.Tk):
         self.video_ready_event = None  # 動画準備完了イベント
         self.win_event = None          # 勝利イベント
         self.video_process = None
-        self.detector = None
         self.cap_webcam = None
         self.camera_list = []
         self.selected_camera = tk.StringVar()
@@ -206,6 +212,35 @@ class App(tk.Tk):
             
         # ポーリング継続
         self.after(100, self.check_detector_queue)
+
+    def _emotion_worker(self):
+        """別スレッドで表情認識を行うワーカー処理"""
+        while self.emotion_thread_active:
+            try:
+                # フレームが来るまで最大0.1秒待機
+                frame = self.frame_queue.get(timeout=0.1)
+                
+                if self.detector is None or not self.detector_ready:
+                    self.frame_queue.task_done()
+                    continue
+
+                # 検出処理 (時間のかかる処理)
+                results = self.detector.detect_emotions(frame)
+                
+                # 古い結果があれば破棄して最新のみをキューに入れる
+                try:
+                    while not self.emotion_queue.empty():
+                        self.emotion_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                    
+                self.emotion_queue.put(results)
+                self.frame_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).error(f"感情検出スレッドエラー: {e}")
 
     def _load_detector_thread(self):
         """顔検出器をロードするワーカースレッド"""
@@ -453,7 +488,20 @@ class App(tk.Tk):
                             fx=resize_scale,
                             fy=resize_scale
                         )
-                        results = self.detector.detect_emotions(small_frame)
+                        
+                        # フレームをワーカーに送る (キューが空の場合のみ)
+                        if self.frame_queue.empty():
+                            self.frame_queue.put(small_frame)
+                        
+                        # 結果があれば取得する
+                        try:
+                            while not self.emotion_queue.empty():
+                                self.latest_emotions = self.emotion_queue.get_nowait()
+                                self.emotion_queue.task_done()
+                        except queue.Empty:
+                            pass
+                            
+                        results = self.latest_emotions
 
                         scale_factor = 1.0 / resize_scale
                         for result in results:
@@ -634,6 +682,9 @@ class App(tk.Tk):
                         if self.video_process.is_alive():
                             logger.error("動画プロセスを終了できませんでした")
             
+            # スレッドの終了
+            self.emotion_thread_active = False
+
             # Webカメラを解放
             if self.cap_webcam:
                 logger.info("Webカメラを解放します")
