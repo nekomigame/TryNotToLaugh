@@ -6,6 +6,7 @@ import os
 import time
 import queue
 import threading
+import cv2
 
 # 抽出したモジュールのインポート
 from constants import GameState
@@ -252,6 +253,7 @@ class App(tk.Tk):
 
     def find_and_update_cameras(self):
         """利用可能なカメラを検索"""
+        import cv2
         self.status_label.config(text="利用可能なWebカメラを検索中...")
         self.update()
 
@@ -262,7 +264,8 @@ class App(tk.Tk):
         self.camera_list = []
         for i in range(self.camera_search_range.get()):
             try:
-                cap = cv2.VideoCapture(i)
+                # DirectShow バックエンドを明示的に指定して高速化＆安定化 (Windows向け)
+                cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
                 if cap.isOpened():
                     self.camera_list.append(f"カメラ {i}")
                     logger.info(f"カメラ {i} を検出しました")
@@ -302,6 +305,7 @@ class App(tk.Tk):
 
     def initialize_capture(self, camera_index):
         """カメラキャプチャの初期化"""
+        import cv2
         # 既存のフィード更新をキャンセル
         if self._feed_update_id:
             self.after_cancel(self._feed_update_id)
@@ -312,8 +316,8 @@ class App(tk.Tk):
             self.cap_webcam.release()
 
         try:
-            import cv2
-            self.cap_webcam = cv2.VideoCapture(camera_index)
+            # DirectShow バックエンドを明示的に指定して高速化＆安定化 (Windows向け)
+            self.cap_webcam = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
 
             if self.cap_webcam.isOpened():
                 self.status_label.config(text=f"Webカメラ {camera_index} を使用中。")
@@ -428,6 +432,7 @@ class App(tk.Tk):
 
         try:
             import cv2
+            import time
             from PIL import Image, ImageTk
             
             ret, frame = self.cap_webcam.read()
