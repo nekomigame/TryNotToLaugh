@@ -3,13 +3,13 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import multiprocessing
 import os
-import time
 import queue
 import threading
-import cv2
+import sys
+import shutil
 
 # OpenCVのログレベルを設定して、不要な警告を抑制
-os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
+os.environ["OPENCV_LOG_LEVEL"] = "FATAL"
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 warnings.filterwarnings('ignore',
                         message=r'.*tf\.lite\.Interpreter is deprecated.*',
