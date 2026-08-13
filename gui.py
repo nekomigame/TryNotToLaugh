@@ -10,6 +10,10 @@ import shutil
 
 # OpenCVのログレベルを設定して、不要な警告を抑制
 os.environ["OPENCV_LOG_LEVEL"] = "FATAL"
+# PyTorch関連モデルのキャッシュ・保存先をカレントディレクトリ配下の .cache ディレクトリに設定
+_cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".cache"))
+os.environ["TORCH_HOME"] = _cache_dir
+os.environ["HF_HOME"] = os.path.join(_cache_dir, "huggingface")
 
 # 抽出したモジュールのインポート
 from constants import GameState
