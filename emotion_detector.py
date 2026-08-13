@@ -1,5 +1,11 @@
 import os
 import sys
+
+# PyTorch関連モデルのキャッシュ・保存先をカレントディレクトリ配下の .cache ディレクトリに設定
+_cache_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".cache"))
+os.environ["TORCH_HOME"] = _cache_dir
+os.environ["HF_HOME"] = os.path.join(_cache_dir, "huggingface")
+
 import logging
 import cv2
 import numpy as np
