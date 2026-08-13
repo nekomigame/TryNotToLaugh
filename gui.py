@@ -10,10 +10,6 @@ import shutil
 
 # OpenCVのログレベルを設定して、不要な警告を抑制
 os.environ["OPENCV_LOG_LEVEL"] = "FATAL"
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-warnings.filterwarnings('ignore',
-                        message=r'.*tf\.lite\.Interpreter is deprecated.*',
-                        category=UserWarning)
 
 # 抽出したモジュールのインポート
 from constants import GameState
@@ -245,10 +241,10 @@ class App(tk.Tk):
     def _load_detector_thread(self):
         """顔検出器をロードするワーカースレッド"""
         try:
-            logger.info("顔検出器 (mtcnn) の初期化を開始...")
-            from fer.fer import FER
-            detector = FER(mtcnn=True)
-            logger.info("FER検出器をMTCNNで初期化しました")
+            logger.info("PyTorch顔検出器 (MTCNN) の初期化を開始...")
+            from emotion_detector import PyTorchEmotionDetector
+            detector = PyTorchEmotionDetector(mtcnn=True)
+            logger.info("PyTorch感情検出器をMTCNNで初期化しました")
             
             # 完了をキューに送信
             self.detector_queue.put(("ready", detector))
@@ -256,13 +252,13 @@ class App(tk.Tk):
         except Exception as e:
             logger.warning(f"MTCNNの初期化に失敗: {e}")
             try:
-                logger.info("mtcnnなしで再試行しています...")
+                logger.info("MTCNNなしで再試行しています...")
                 # ステータス更新をキューに送信
-                self.detector_queue.put(("status", "mtcnnなしで再試行しています..."))
+                self.detector_queue.put(("status", "MTCNNなしで再試行しています..."))
                 
-                from fer.fer import FER
-                detector = FER(mtcnn=False)
-                logger.info("FER検出器をMTCNNなしで初期化しました")
+                from emotion_detector import PyTorchEmotionDetector
+                detector = PyTorchEmotionDetector(mtcnn=False)
+                logger.info("PyTorch感情検出器をMTCNNなしで初期化しました")
                 
                 # 完了をキューに送信
                 self.detector_queue.put(("ready", detector))

@@ -17,29 +17,6 @@ logger = logging.getLogger(__name__)
 # --- Windowsにおける非ASCIIパスの問題に対するパッチ ---
 if sys.platform == 'win32':
     try:
-        import tensorflow as tf
-        
-        original_interpreter_init = tf.lite.Interpreter.__init__
-
-        def new_interpreter_init(self, model_path=None, model_content=None, **kwargs):
-            if model_path and not model_content:
-                try:
-                    model_path.encode('ascii')
-                except UnicodeEncodeError:
-                    try:
-                        with open(model_path, 'rb') as f:
-                            model_content = f.read()
-                        model_path = None
-                        logger.info("非ASCIIパスを検出: モデルをメモリに読み込みました")
-                    except Exception as e:
-                        logger.warning(f"モデルの読み込みに失敗: {e}")
-            original_interpreter_init(self, model_path=model_path, model_content=model_content, **kwargs)
-
-        tf.lite.Interpreter.__init__ = new_interpreter_init
-    except (ImportError, AttributeError) as e:
-        logger.debug(f"TensorFlowパッチをスキップ: {e}")
-
-    try:
         import cv2
         import tempfile
 
